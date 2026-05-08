@@ -1,16 +1,25 @@
 use ndarray::{Array3, Axis};
 use numpy::{IntoPyArray, PyArray1, PyArray4, PyReadonlyArray1};
+use opendal::{Operator, services::S3};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use rust_lapper::{Interval, Lapper};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::env;
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
+use tokio::runtime::Runtime;
+use url::Url;
 use zarrs::array::Array;
 use zarrs::array_subset::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
 use zarrs::group::Group;
+use zarrs::storage::ReadableListableStorageTraits;
+use zarrs::storage::storage_adapter::async_to_sync::{AsyncToSyncBlockOn, AsyncToSyncStorageAdapter};
+use zarrs_opendal::AsyncOpendalStore;
+
+const DEFAULT_OSS_ENDPOINT: &str = "http://oss-cn-hangzhou-zjy-d01-a.res.cloud.zhejianglab.com";
 
 #[derive(Error, Debug)]
 pub enum MsirError {
@@ -30,6 +39,122 @@ impl From<MsirError> for PyErr {
     }
 }
 
+/// 共享的 tokio runtime，供 AsyncToSyncStorageAdapter 使用。
+fn shared_runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        Runtime::new().expect("failed to create tokio runtime for msir")
+    })
+}
+
+/// 将 tokio runtime 适配到 zarrs 的 AsyncToSyncBlockOn trait。
+struct TokioBlockOn;
+
+impl AsyncToSyncBlockOn for TokioBlockOn {
+    fn block_on<F: Future>(&self, future: F) -> F::Output {
+        let _guard = shared_runtime().enter();
+        shared_runtime().block_on(future)
+    }
+}
+
+/// zarrs 同步可读 + 可列举的统一 store 类型别名。
+/// `child_groups` 需要 `ListableStorageTraits`，所以这里采用组合 trait。
+type ReadableStore = Arc<dyn ReadableListableStorageTraits>;
+
+/// 根据 path 字符串构建一个 zarrs 同步可读 store。
+///
+/// 支持：
+/// - 本地路径（无 scheme 或 `file://`）：返回 `FilesystemStore`。
+/// - `oss://[user[:pass]@]<bucket-or-host>/<path>`：返回经 AsyncToSyncStorageAdapter 包装的
+///   `AsyncOpendalStore`，凭证、endpoint 与 [create_zarr_store] 的 Python 实现保持一致。
+fn build_store(path: &str) -> PyResult<ReadableStore> {
+    // 先识别是否为 OSS URL；非 URL 形式（绝对/相对本地路径）走 FilesystemStore。
+    let parsed = Url::parse(path).ok();
+
+    match parsed.as_ref().map(|u| u.scheme()) {
+        None | Some("") | Some("file") => {
+            let local_path = parsed
+                .as_ref()
+                .map(|u| u.path().to_string())
+                .unwrap_or_else(|| path.to_string());
+            let store = FilesystemStore::new(&local_path)
+                .map_err(|e| PyValueError::new_err(format!("Failed to open filesystem store: {}", e)))?;
+            Ok(Arc::new(store))
+        }
+        Some("oss") => {
+            let url = parsed.expect("checked above");
+
+            // 与 Python 端 create_zarr_store 的语义对齐：
+            //   - bucket 取 URL path 的第一段；
+            //   - endpoint 优先用 URL host（`<scheme>://<host>[:port]`，oss scheme 默认使用 http），
+            //     host 为空时回退到 OSS_ENDPOINT 环境变量，再回退到默认 endpoint；
+            //   - access_key_id / access_key_secret 先读 URL userinfo，再回退到环境变量。
+            let full_path = url.path().trim_start_matches('/').to_string();
+            let (bucket, root_in_bucket) = match full_path.split_once('/') {
+                Some((b, rest)) if !b.is_empty() => (b.to_string(), rest.to_string()),
+                _ if !full_path.is_empty() => (full_path.clone(), String::new()),
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "oss:// URL missing bucket in path (expected oss://[host]/<bucket>/<path>)",
+                    ));
+                }
+            };
+
+            let access_key_id = if !url.username().is_empty() {
+                Some(url.username().to_string())
+            } else {
+                env::var("OSS_ACCESS_KEY_ID").ok()
+            };
+            let access_key_secret = url
+                .password()
+                .map(|s| s.to_string())
+                .or_else(|| env::var("OSS_ACCESS_KEY_SECRET").ok());
+
+            let endpoint = match url.host_str() {
+                Some(host) if !host.is_empty() => {
+                    // oss:// 视为未指定具体协议，默认用 http；非 oss scheme 则沿用其 scheme。
+                    let scheme = "http";
+                    if let Some(port) = url.port() {
+                        format!("{}://{}:{}", scheme, host, port)
+                    } else {
+                        format!("{}://{}", scheme, host)
+                    }
+                }
+                _ => env::var("OSS_ENDPOINT").unwrap_or_else(|_| DEFAULT_OSS_ENDPOINT.to_string()),
+            };
+
+            let root = format!("/{}", root_in_bucket);
+            // 与 Python 端对齐：Python 通过 s3fs + endpoint_url 访问 OSS/内部存储，走的是 S3 兼容协议。
+            // opendal 的 services-oss 仅适用于阿里云 OSS 原生协议，对 S3 兼容 endpoint 请求
+            // 会成功建立连接但返回空数据。因此统一用 services-s3。
+            let mut builder = S3::default()
+                .bucket(&bucket)
+                .endpoint(&endpoint)
+                .root(&root)
+                // opendal S3 要求 region 字段。对于非 AWS 的 S3 兼容存储，region 仅用于签名，
+                // 具体值无实际意义。优先取 AWS_REGION，否则默认 "auto"。
+                .region(&env::var("AWS_REGION").unwrap_or_else(|_| "auto".to_string()));
+            if let Some(k) = access_key_id.as_deref() {
+                builder = builder.access_key_id(k);
+            }
+            if let Some(s) = access_key_secret.as_deref() {
+                builder = builder.secret_access_key(s);
+            }
+
+            let op = Operator::new(builder)
+                .map_err(|e| PyValueError::new_err(format!("Failed to build S3 operator: {}", e)))?
+                .finish();
+            let async_store = Arc::new(AsyncOpendalStore::new(op));
+            let sync_store = AsyncToSyncStorageAdapter::new(async_store, TokioBlockOn);
+            Ok(Arc::new(sync_store))
+        }
+        Some(other) => Err(PyValueError::new_err(format!(
+            "unsupported scheme {:?} for AstroImageReader path",
+            other
+        ))),
+    }
+}
+
 /// 存储每个 interval 的元数据: (subset_path, offset)
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IntervalData {
@@ -45,18 +170,18 @@ type IvType = Interval<usize, IntervalData>;
 /// 使用 zarrs 库高效读取 zarr 格式的天文图像数据。
 #[pyclass]
 pub struct AstroImageReader {
-    /// zarr 数据集根路径
-    zarr_root_path: PathBuf,
+    /// zarr 数据集根路径（本地路径或 oss:// URL，原样保存）。
+    zarr_root_path: String,
     /// interval tree 索引
     index: Arc<Lapper<usize, IntervalData>>,
     /// 子集列表 (用于遍历)
     subsets: Vec<String>,
     /// 裁剪大小
     crop_size: usize,
+    /// 是否禁用 mask
+    disable_mask: bool,
     /// 是否禁用 ivar
     disable_ivar: bool,
-    /// 是否为训练模式
-    training: bool,
     /// 通道数
     num_channels: usize,
     /// 总样本数
@@ -65,32 +190,24 @@ pub struct AstroImageReader {
 
 #[pymethods]
 impl AstroImageReader {
-    /// 创建新的 ZarrReader 实例
+    /// 创建新的 AstroImageReader 实例
     ///
     /// Args:
-    ///     path: zarr 数据集的根路径
+    ///     path: zarr 数据集的根路径，支持本地路径和 `oss://` URL。
     ///     crop_size: 裁剪大小 (默认 96)
+    ///     disable_mask: 是否禁用 mask 读取 (默认 False)
     ///     disable_ivar: 是否禁用 ivar 读取 (默认 False)
     ///     max_chunk_size: 最大切片大小，用于将大索引区间切分 (默认 5000)
-    ///
-    /// Returns:
-    ///     ZarrReader 实例
     #[new]
-    #[pyo3(signature = (path, crop_size=96, disable_ivar=false, max_chunk_size=5000))]
+    #[pyo3(signature = (path, crop_size=96, disable_mask=false, disable_ivar=false, max_chunk_size=5000))]
     pub fn new(
         path: &str,
         crop_size: usize,
+        disable_mask: bool,
         disable_ivar: bool,
         max_chunk_size: usize,
     ) -> PyResult<Self> {
-        let zarr_root_path = PathBuf::from(path.trim_end_matches('/'));
-
-        // 从路径推断 split (train/val/test)
-        let split = zarr_root_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let training = split == "train";
+        let zarr_root_path = path.trim_end_matches('/').to_string();
 
         // 构建索引
         let (index, subsets, total_samples, num_channels) =
@@ -101,8 +218,8 @@ impl AstroImageReader {
             index: Arc::new(index),
             subsets,
             crop_size,
+            disable_mask,
             disable_ivar,
-            training,
             num_channels,
             total_samples,
         })
@@ -126,10 +243,16 @@ impl AstroImageReader {
         self.crop_size
     }
 
-    /// 获取是否为训练模式
+    /// 获取是否禁用 mask
     #[getter]
-    pub fn training(&self) -> bool {
-        self.training
+    pub fn disable_mask(&self) -> bool {
+        self.disable_mask
+    }
+
+    /// 获取是否禁用 ivar
+    #[getter]
+    pub fn disable_ivar(&self) -> bool {
+        self.disable_ivar
     }
 
     /// 获取子集列表
@@ -146,8 +269,8 @@ impl AstroImageReader {
     /// Returns:
     ///     tuple: (flux, mask, ivar)
     ///         - flux: shape (N, C, H, W) 的 float32 数组
-    ///         - mask: shape (N, C, H, W) 或 (N, 1, H, W) 的 bool 数组，训练模式下返回，否则为 None
-    ///         - ivar: shape (N, C, H, W) 的 float32 数组，训练模式且未禁用时返回，否则为 None
+    ///         - mask: shape (N, C, H, W) 或 (N, 1, H, W) 的 bool 数组，未禁用时返回，否则为 None
+    ///         - ivar: shape (N, C, H, W) 的 float32 数组，未禁用时返回，否则为 None
     pub fn read_batch<'py>(
         &self,
         py: Python<'py>,
@@ -228,12 +351,6 @@ impl AstroImageReader {
     }
 
     /// 读取单个样本 (返回 numpy 数组)
-    ///
-    /// Args:
-    ///     index: 样本索引
-    ///
-    /// Returns:
-    ///     tuple: (flux, mask, ivar)
     pub fn read_single<'py>(
         &self,
         py: Python<'py>,
@@ -262,12 +379,6 @@ impl AstroImageReader {
     }
 
     /// 获取样本的地址 (subset_path, local_idx)
-    ///
-    /// Args:
-    ///     index: 全局样本索引
-    ///
-    /// Returns:
-    ///     tuple 或 None: (subset_path, local_idx) 如果索引有效
     pub fn get_addr(&self, index: i64) -> Option<(String, usize)> {
         self.get_example_addr(index as usize)
     }
@@ -291,16 +402,13 @@ impl AstroImageReader {
 impl AstroImageReader {
     /// 构建索引
     fn build_index(
-        zarr_root_path: &PathBuf,
+        zarr_root_path: &str,
         max_chunk_size: usize,
     ) -> PyResult<(Lapper<usize, IntervalData>, Vec<String>, usize, usize)> {
-        let store = Arc::new(
-            FilesystemStore::new(zarr_root_path)
-                .map_err(|e| PyValueError::new_err(format!("Failed to open store: {}", e)))?,
-        );
+        let store = build_store(zarr_root_path)?;
         let root = Group::open(store.clone(), "/")
             .map_err(|e| PyValueError::new_err(format!("Failed to open root group: {}", e)))?;
-        
+
         let child_groups = root
             .child_groups()
             .map_err(|e| PyValueError::new_err(format!("Failed to list children: {}", e)))?;
@@ -326,7 +434,7 @@ impl AstroImageReader {
             }
             let subset_path = format!("/{}", subset_name);
             // 获取 flux 数组的形状
-            let flux_array = Array::<FilesystemStore>::open(store.clone(), &format!("{}/flux", subset_path))
+            let flux_array = Array::open(store.clone(), &format!("{}/flux", subset_path))
                 .map_err(|e| PyValueError::new_err(format!("Failed to open flux array: {}", e)))?;
 
             let shape = flux_array.shape();
@@ -391,13 +499,10 @@ impl AstroImageReader {
         subset_path: &str,
         local_idx: usize,
     ) -> PyResult<(Array3<f32>, Option<Array3<bool>>, Option<Array3<f32>>)> {
-        let store = Arc::new(
-            FilesystemStore::new(&self.zarr_root_path)
-                .map_err(|e| PyValueError::new_err(format!("Failed to open store: {}", e)))?,
-        );
+        let store = build_store(&self.zarr_root_path)?;
 
         let flux_path = format!("/{}/flux", subset_path);
-        let flux_array = Array::<FilesystemStore>::open(store.clone(), &flux_path)
+        let flux_array = Array::open(store.clone(), &flux_path)
             .map_err(|e| PyValueError::new_err(format!("Failed to open flux: {}", e)))?;
 
         // 计算中心裁剪的范围
@@ -430,17 +535,15 @@ impl AstroImageReader {
             .into_dimensionality::<ndarray::Ix3>()
             .map_err(|e| PyValueError::new_err(format!("Dimension error: {}", e)))?;
 
-        // 读取 mask (训练模式下)
-        // mask 形状与 flux 相同: [N, C, H, W]
-        let mask_3d = if self.training {
+        // 读取 mask（未禁用时）
+        // mask 形状可能与 flux 同（4D）或缺通道维（3D）
+        let mask_3d = if !self.disable_mask {
             let mask_path = format!("/{}/mask", subset_path);
-            let mask_array = Array::<FilesystemStore>::open(store.clone(), &mask_path)
+            let mask_array = Array::open(store.clone(), &mask_path)
                 .map_err(|e| PyValueError::new_err(format!("Failed to open mask: {}", e)))?;
 
             let mask_shape = mask_array.shape();
-            // mask 可能是 3D [N, H, W] 或 4D [N, C, H, W]
             let mask_subset = if mask_shape.len() == 4 {
-                // 4D: [N, C, H, W]
                 ArraySubset::new_with_ranges(&[
                     local_idx as u64..(local_idx + 1) as u64,
                     0..mask_shape[1],
@@ -448,20 +551,17 @@ impl AstroImageReader {
                     start_x as u64..(start_x + self.crop_size) as u64,
                 ])
             } else {
-                // 3D: [N, H, W]
                 ArraySubset::new_with_ranges(&[
                     local_idx as u64..(local_idx + 1) as u64,
                     start_y as u64..(start_y + self.crop_size) as u64,
                     start_x as u64..(start_x + self.crop_size) as u64,
                 ])
             };
-            
-            // 读取为 bool 类型
+
             let mask_data: ndarray::ArrayD<bool> = mask_array
                 .retrieve_array_subset_ndarray(&mask_subset)
                 .map_err(|e| PyValueError::new_err(format!("Failed to read mask: {}", e)))?;
-            
-            // 根据形状调整输出
+
             let mask_3d = if mask_shape.len() == 4 {
                 let num_mask_channels = mask_shape[1] as usize;
                 mask_data
@@ -474,7 +574,6 @@ impl AstroImageReader {
                     .into_dimensionality::<ndarray::Ix3>()
                     .map_err(|e| PyValueError::new_err(format!("Dimension error: {}", e)))?
             } else {
-                // 3D -> (1, H, W)
                 mask_data
                     .into_shape_with_order(ndarray::IxDyn(&[1, self.crop_size, self.crop_size]))
                     .map_err(|e| PyValueError::new_err(format!("Reshape error: {}", e)))?
@@ -487,10 +586,10 @@ impl AstroImageReader {
             None
         };
 
-        // 读取 ivar (训练模式且未禁用)
-        let ivar_3d = if self.training && !self.disable_ivar {
+        // 读取 ivar（未禁用时）
+        let ivar_3d = if !self.disable_ivar {
             let ivar_path = format!("/{}/ivar", subset_path);
-            let ivar_array = Array::<FilesystemStore>::open(store.clone(), &ivar_path)
+            let ivar_array = Array::open(store.clone(), &ivar_path)
                 .map_err(|e| PyValueError::new_err(format!("Failed to open ivar: {}", e)))?;
 
             let ivar_subset = ArraySubset::new_with_ranges(&[
