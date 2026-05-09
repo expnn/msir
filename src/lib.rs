@@ -1,7 +1,7 @@
 use ndarray::{Array3, Axis};
 use numpy::{IntoPyArray, PyArray1, PyArray4, PyReadonlyArray1};
 use opendal::{Operator, services::S3};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyValueError, PyRuntimeError, PyIOError, PyIndexError};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use rust_lapper::{Interval, Lapper};
@@ -10,7 +10,7 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::runtime::Runtime;
-use url::Url;
+use url::{Url, ParseError};
 use zarrs::array::Array;
 use zarrs::array_subset::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
@@ -19,6 +19,7 @@ use zarrs::storage::ReadableListableStorageTraits;
 use zarrs::storage::storage_adapter::async_to_sync::{AsyncToSyncBlockOn, AsyncToSyncStorageAdapter};
 use zarrs_opendal::AsyncOpendalStore;
 
+// noinspection HttpUrlsUsage
 const DEFAULT_OSS_ENDPOINT: &str = "http://oss-cn-hangzhou-zjy-d01-a.res.cloud.zhejianglab.com";
 
 #[derive(Error, Debug)]
@@ -35,16 +36,25 @@ pub enum MsirError {
 
 impl From<MsirError> for PyErr {
     fn from(err: MsirError) -> PyErr {
-        PyValueError::new_err(err.to_string())
+        match err {
+            MsirError::Zarr(e) => PyIOError::new_err(e.to_string()),
+            MsirError::IndexOutOfBounds(e) => PyIndexError::new_err(e.to_string()),
+            MsirError::InvalidShape(e) => PyValueError::new_err(e.to_string()),
+            MsirError::Io(e) => PyIOError::new_err(e.to_string()),
+        }
     }
 }
 
 /// 共享的 tokio runtime，供 AsyncToSyncStorageAdapter 使用。
-fn shared_runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        Runtime::new().expect("failed to create tokio runtime for msir")
-    })
+fn shared_runtime() -> Result<&'static Runtime, PyErr> {
+    static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
+    let result = RUNTIME.get_or_init(|| {
+        Runtime::new().map_err(|e| format!("failed to create tokio runtime for msir: {}", e))
+    });
+    match result {
+        Ok(rt) => Ok(rt),
+        Err(e) => Err(PyRuntimeError::new_err(e.clone())),
+    }
 }
 
 /// 将 tokio runtime 适配到 zarrs 的 AsyncToSyncBlockOn trait。
@@ -52,8 +62,20 @@ struct TokioBlockOn;
 
 impl AsyncToSyncBlockOn for TokioBlockOn {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
-        let _guard = shared_runtime().enter();
-        shared_runtime().block_on(future)
+        // 注意：AsyncToSyncBlockOn::block_on 的签名不允许返回 Result，
+        // 但此处 shared_runtime() 仅在首次初始化时可能失败。
+        // 如果 runtime 初始化失败，build_store 中的 shared_runtime()? 会提前返回错误，
+        // 因此此处不会被执行到。使用 match + unreachable 分支来避免 unwrap。
+        let rt = match shared_runtime() {
+            Ok(rt) => rt,
+            Err(_) => {
+                // 理论上不可达：如果 runtime 创建失败，调用链不会走到这里。
+                // 但为安全起见，abort 而非 panic（避免 unwind 穿越 FFI 边界）。
+                std::process::abort();
+            }
+        };
+        let _guard = rt.enter();
+        rt.block_on(future)
     }
 }
 
@@ -69,30 +91,35 @@ type ReadableStore = Arc<dyn ReadableListableStorageTraits>;
 ///   `AsyncOpendalStore`，凭证、endpoint 与 [create_zarr_store] 的 Python 实现保持一致。
 fn build_store(path: &str) -> PyResult<ReadableStore> {
     // 先识别是否为 OSS URL；非 URL 形式（绝对/相对本地路径）走 FilesystemStore。
-    let parsed = Url::parse(path).ok();
+    let parsed = match Url::parse(path) {
+        Ok(u) => u,
+        Err(ParseError::RelativeUrlWithoutBase) => {
+            match Url::parse(&format!("file://{}", path)) {
+                Ok(u) => u,
+                Err(e) => return Err(PyValueError::new_err(format!("Invalid URL: {path:?}. Reason: {e}"))),
+            }
+        },
+        Err(e) => return Err(PyValueError::new_err(format!("Invalid URL: {path:?}. Reason: {e}"))),
+    };
 
-    match parsed.as_ref().map(|u| u.scheme()) {
-        None | Some("") | Some("file") => {
-            let local_path = parsed
-                .as_ref()
-                .map(|u| u.path().to_string())
-                .unwrap_or_else(|| path.to_string());
-            let store = FilesystemStore::new(&local_path)
+    let scheme = parsed.scheme();
+    match scheme {
+        "file" => {
+            let local_path = parsed.path();
+            let store = FilesystemStore::new(local_path)
                 .map_err(|e| PyValueError::new_err(format!("Failed to open filesystem store: {}", e)))?;
             Ok(Arc::new(store))
         }
-        Some("oss") => {
-            let url = parsed.expect("checked above");
-
+        "oss" | "http" | "https" => {
             // 与 Python 端 create_zarr_store 的语义对齐：
             //   - bucket 取 URL path 的第一段；
             //   - endpoint 优先用 URL host（`<scheme>://<host>[:port]`，oss scheme 默认使用 http），
             //     host 为空时回退到 OSS_ENDPOINT 环境变量，再回退到默认 endpoint；
             //   - access_key_id / access_key_secret 先读 URL userinfo，再回退到环境变量。
-            let full_path = url.path().trim_start_matches('/').to_string();
+            let full_path = parsed.path().trim_start_matches('/');
             let (bucket, root_in_bucket) = match full_path.split_once('/') {
-                Some((b, rest)) if !b.is_empty() => (b.to_string(), rest.to_string()),
-                _ if !full_path.is_empty() => (full_path.clone(), String::new()),
+                Some((b, rest)) if !b.is_empty() => (b, rest),
+                _ if !full_path.is_empty() => (full_path, ""),
                 _ => {
                     return Err(PyValueError::new_err(
                         "oss:// URL missing bucket in path (expected oss://[host]/<bucket>/<path>)",
@@ -100,21 +127,21 @@ fn build_store(path: &str) -> PyResult<ReadableStore> {
                 }
             };
 
-            let access_key_id = if !url.username().is_empty() {
-                Some(url.username().to_string())
+            let access_key_id = if !parsed.username().is_empty() {
+                Some(parsed.username().to_string())
             } else {
                 env::var("OSS_ACCESS_KEY_ID").ok()
             };
-            let access_key_secret = url
+            let access_key_secret = parsed
                 .password()
                 .map(|s| s.to_string())
                 .or_else(|| env::var("OSS_ACCESS_KEY_SECRET").ok());
 
-            let endpoint = match url.host_str() {
+            let endpoint = match parsed.host_str() {
                 Some(host) if !host.is_empty() => {
                     // oss:// 视为未指定具体协议，默认用 http；非 oss scheme 则沿用其 scheme。
-                    let scheme = "http";
-                    if let Some(port) = url.port() {
+                    let scheme = if scheme == "oss" { "http" } else { scheme };
+                    if let Some(port) = parsed.port() {
                         format!("{}://{}:{}", scheme, host, port)
                     } else {
                         format!("{}://{}", scheme, host)
@@ -133,7 +160,7 @@ fn build_store(path: &str) -> PyResult<ReadableStore> {
                 .root(&root)
                 // opendal S3 要求 region 字段。对于非 AWS 的 S3 兼容存储，region 仅用于签名，
                 // 具体值无实际意义。优先取 AWS_REGION，否则默认 "auto"。
-                .region(&env::var("AWS_REGION").unwrap_or_else(|_| "auto".to_string()));
+                .region(&env::var("OSS_REGION").unwrap_or_else(|_| "auto".to_string()));
             if let Some(k) = access_key_id.as_deref() {
                 builder = builder.access_key_id(k);
             }
@@ -144,14 +171,13 @@ fn build_store(path: &str) -> PyResult<ReadableStore> {
             let op = Operator::new(builder)
                 .map_err(|e| PyValueError::new_err(format!("Failed to build S3 operator: {}", e)))?
                 .finish();
+            // 提前验证 runtime 可用，避免后续 block_on 时才发现失败
+            let _ = shared_runtime()?;
             let async_store = Arc::new(AsyncOpendalStore::new(op));
             let sync_store = AsyncToSyncStorageAdapter::new(async_store, TokioBlockOn);
             Ok(Arc::new(sync_store))
         }
-        Some(other) => Err(PyValueError::new_err(format!(
-            "unsupported scheme {:?} for AstroImageReader path",
-            other
-        ))),
+        other => Err(PyValueError::new_err(format!("unsupported scheme {:?} for AstroImageReader path", other))),
     }
 }
 
@@ -438,6 +464,12 @@ impl AstroImageReader {
                 .map_err(|e| PyValueError::new_err(format!("Failed to open flux array: {}", e)))?;
 
             let shape = flux_array.shape();
+            if shape.len() != 4 {
+                return Err(PyValueError::new_err(format!(
+                    "Expected flux array to have at least 2 dimensions, got {}",
+                    shape.len()
+                )));
+            }
             let num_examples = shape[0] as usize;
 
             if num_channels == 0 {
@@ -507,8 +539,20 @@ impl AstroImageReader {
 
         // 计算中心裁剪的范围
         let shape = flux_array.shape();
+        if shape.len() != 4 {
+            return Err(PyValueError::new_err(format!(
+                "Expected flux array to have 4 dimensions (N, C, H, W), got {}",
+                shape.len()
+            )));
+        }
         let height = shape[2] as usize;
         let width = shape[3] as usize;
+        if height < self.crop_size || width < self.crop_size {
+            return Err(PyValueError::new_err(format!(
+                "Image size ({}x{}) is smaller than crop_size ({})",
+                height, width, self.crop_size
+            )));
+        }
         let start_y = (height - self.crop_size) / 2;
         let start_x = (width - self.crop_size) / 2;
 
