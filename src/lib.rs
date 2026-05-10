@@ -1,7 +1,7 @@
 use ndarray::{Array3, Axis};
 use numpy::{IntoPyArray, PyArray1, PyArray4, PyReadonlyArray1};
 use opendal::{Operator, services::S3};
-use pyo3::exceptions::{PyValueError, PyRuntimeError, PyIOError, PyIndexError};
+use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use rust_lapper::{Interval, Lapper};
@@ -10,7 +10,7 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::runtime::Runtime;
-use url::{Url, ParseError};
+use url::{ParseError, Url};
 use zarrs::array::Array;
 use zarrs::array_subset::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
@@ -46,15 +46,24 @@ impl From<MsirError> for PyErr {
 }
 
 /// 共享的 tokio runtime，供 AsyncToSyncStorageAdapter 使用。
-fn shared_runtime() -> Result<&'static Runtime, PyErr> {
-    static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
-    let result = RUNTIME.get_or_init(|| {
-        Runtime::new().map_err(|e| format!("failed to create tokio runtime for msir: {}", e))
-    });
-    match result {
-        Ok(rt) => Ok(rt),
-        Err(e) => Err(PyRuntimeError::new_err(e.clone())),
-    }
+///
+/// 该 runtime 在模块初始化阶段（参见下方 `#[pymodule_init]` 标记的函数）通过
+/// `OnceLock::set` 一次性写入。之后所有访问都只调用 `OnceLock::get`，不会进入
+/// 任何初始化闭包，因此不存在 PyO3 FAQ 中提到的 `get_or_init` 在 GIL 下执行
+/// 阻塞闭包所引发的死锁风险。
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+/// 获取已初始化的 tokio runtime 引用。
+///
+/// 模块初始化（`init_module`）成功意味着 `RUNTIME` 已经被 `set`，Python 端只要
+/// `import msir` 成功，本函数即永远返回有效引用。初始化失败会在模块导入阶段
+/// 直接抛出 `ImportError`，不会进入此函数。
+fn runtime() -> &'static Runtime {
+    // 仅调用 `get`，不使用 `get_or_init`，因此与 PyO3 GIL 之间不存在
+    // OnceLock 初始化闭包可能引入的死锁问题。
+    RUNTIME
+        .get()
+        .expect("tokio runtime must be initialized during msir module import")
 }
 
 /// 将 tokio runtime 适配到 zarrs 的 AsyncToSyncBlockOn trait。
@@ -62,18 +71,7 @@ struct TokioBlockOn;
 
 impl AsyncToSyncBlockOn for TokioBlockOn {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
-        // 注意：AsyncToSyncBlockOn::block_on 的签名不允许返回 Result，
-        // 但此处 shared_runtime() 仅在首次初始化时可能失败。
-        // 如果 runtime 初始化失败，build_store 中的 shared_runtime()? 会提前返回错误，
-        // 因此此处不会被执行到。使用 match + unreachable 分支来避免 unwrap。
-        let rt = match shared_runtime() {
-            Ok(rt) => rt,
-            Err(_) => {
-                // 理论上不可达：如果 runtime 创建失败，调用链不会走到这里。
-                // 但为安全起见，abort 而非 panic（避免 unwind 穿越 FFI 边界）。
-                std::process::abort();
-            }
-        };
+        let rt = runtime();
         let _guard = rt.enter();
         rt.block_on(future)
     }
@@ -171,8 +169,7 @@ fn build_store(path: &str) -> PyResult<ReadableStore> {
             let op = Operator::new(builder)
                 .map_err(|e| PyValueError::new_err(format!("Failed to build S3 operator: {}", e)))?
                 .finish();
-            // 提前验证 runtime 可用，避免后续 block_on 时才发现失败
-            let _ = shared_runtime()?;
+            // runtime 已在模块初始化阶段创建，这里无需再次校验。
             let async_store = Arc::new(AsyncOpendalStore::new(op));
             let sync_store = AsyncToSyncStorageAdapter::new(async_store, TokioBlockOn);
             Ok(Arc::new(sync_store))
@@ -666,9 +663,39 @@ impl AstroImageReader {
     }
 }
 
-/// A Python module implemented in Rust.
+/// Python 模块定义。
+///
+/// 使用声明式模块语法（`#[pymodule] mod ...`），以便通过 `#[pymodule_init]`
+/// 在模块导入阶段完成 tokio runtime 的一次性初始化。
 #[pymodule]
-fn msir(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<AstroImageReader>()?;
-    Ok(())
+mod msir {
+    use pyo3::exceptions::PyImportError;
+    use pyo3::prelude::*;
+    use tokio::runtime::Runtime;
+
+    // 将 `AstroImageReader` 暴露到 Python 模块命名空间。
+    #[pymodule_export]
+    use super::AstroImageReader;
+
+    /// 模块初始化：在此处创建 tokio runtime。
+    ///
+    /// - 初始化只发生一次，且发生在 Python `import msir` 的过程中；
+    /// - 若创建失败，直接抛出 `ImportError`，让 `import` 自身失败，
+    ///   避免后续运行时再处理 runtime 不可用的情况；
+    /// - 通过 `OnceLock::set`（而非 `get_or_init`）写入，后续访问只读，
+    ///   不存在 GIL + OnceLock 初始化闭包带来的死锁风险
+    ///   （见 PyO3 FAQ）。
+    #[pymodule_init]
+    fn init_module(_m: &Bound<'_, PyModule>) -> PyResult<()> {
+        let rt = Runtime::new().map_err(|e| {
+            PyImportError::new_err(format!(
+                "failed to create tokio runtime for msir: {}",
+                e
+            ))
+        })?;
+        super::RUNTIME.set(rt).map_err(|_| {
+            PyImportError::new_err("msir tokio runtime is already initialized")
+        })?;
+        Ok(())
+    }
 }
