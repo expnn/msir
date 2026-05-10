@@ -1,4 +1,4 @@
-use ndarray::{Array3, Axis};
+use ndarray::{Array3, Array4, Axis};
 use numpy::{IntoPyArray, PyArray1, PyArray4, PyReadonlyArray1};
 use opendal::{Operator, services::S3};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
@@ -224,6 +224,7 @@ impl AstroImageReader {
     #[new]
     #[pyo3(signature = (path, crop_size=96, disable_mask=false, disable_ivar=false, max_chunk_size=5000))]
     pub fn new(
+        py: Python<'_>,
         path: &str,
         crop_size: usize,
         disable_mask: bool,
@@ -232,9 +233,9 @@ impl AstroImageReader {
     ) -> PyResult<Self> {
         let zarr_root_path = path.trim_end_matches('/').to_string();
 
-        // 构建索引
+        // 构建索引涉及远程/本地 I/O，释放 GIL 以允许其他 Python 线程并发执行。
         let (index, subsets, total_samples, num_channels) =
-            Self::build_index(&zarr_root_path, max_chunk_size)?;
+            py.detach(|| Self::build_index(&zarr_root_path, max_chunk_size))?;
 
         Ok(AstroImageReader {
             zarr_root_path,
@@ -294,6 +295,9 @@ impl AstroImageReader {
     ///         - flux: shape (N, C, H, W) 的 float32 数组
     ///         - mask: shape (N, C, H, W) 或 (N, 1, H, W) 的 bool 数组，未禁用时返回，否则为 None
     ///         - ivar: shape (N, C, H, W) 的 float32 数组，未禁用时返回，否则为 None
+    ///
+    /// 注意: 调用期间内部会释放 GIL，调用方必须保证在本次调用返回前不从其他
+    /// 线程修改 `indices` 数组，否则行为未定义。
     pub fn read_batch<'py>(
         &self,
         py: Python<'py>,
@@ -303,67 +307,78 @@ impl AstroImageReader {
         Option<Bound<'py, PyArray4<bool>>>,
         Option<Bound<'py, PyArray4<f32>>>,
     )> {
-        let indices = indices.as_slice()?;
+        // &[i64] 指向 numpy 底层 C 缓冲区，满足 Send + Sync + Ungil，可直接跨
+        // detach 边界使用；调用方需遵守上方 doc 中“不得并发修改 indices”的约定。
+        let idx_slice: &[i64] = indices.as_slice()?;
 
-        // 预先收集所有需要读取的样本地址
-        let addrs: Vec<Option<(String, usize)>> = indices
-            .iter()
-            .map(|&idx| self.get_example_addr(idx as usize))
-            .collect();
+        // 并行 I/O + ndarray::stack 均为纯 Rust 工作，无需 GIL，整体放入 detach 闭包。
+        let (flux_4d, mask_4d, ivar_4d) = py.detach(|| -> PyResult<(
+            Array4<f32>,
+            Option<Array4<bool>>,
+            Option<Array4<f32>>,
+        )> {
+            // 预先收集所有需要读取的样本地址
+            let addrs: Vec<Option<(String, usize)>> = idx_slice
+                .iter()
+                .map(|&idx| self.get_example_addr(idx as usize))
+                .collect();
 
-        // 并行读取所有样本
-        let results: Vec<PyResult<(Array3<f32>, Option<Array3<bool>>, Option<Array3<f32>>)>> = addrs
-            .into_par_iter()
-            .map(|addr| match addr {
-                Some((subset_path, local_idx)) => self.read_single_example(&subset_path, local_idx),
-                None => Err(MsirError::IndexOutOfBounds(-1).into()),
-            })
-            .collect();
+            // 并行读取所有样本
+            let results: Vec<PyResult<(Array3<f32>, Option<Array3<bool>>, Option<Array3<f32>>)>> = addrs
+                .into_par_iter()
+                .map(|addr| match addr {
+                    Some((subset_path, local_idx)) => self.read_single_example(&subset_path, local_idx),
+                    None => Err(MsirError::IndexOutOfBounds(-1).into()),
+                })
+                .collect();
 
-        // 收集有效结果
-        let mut fluxes: Vec<Array3<f32>> = Vec::with_capacity(results.len());
-        let mut masks: Vec<Array3<bool>> = Vec::with_capacity(results.len());
-        let mut ivars: Vec<Array3<f32>> = Vec::with_capacity(results.len());
+            // 收集有效结果
+            let mut fluxes: Vec<Array3<f32>> = Vec::with_capacity(results.len());
+            let mut masks: Vec<Array3<bool>> = Vec::with_capacity(results.len());
+            let mut ivars: Vec<Array3<f32>> = Vec::with_capacity(results.len());
 
-        for result in results {
-            let (flux, mask, ivar) = result?;
-            fluxes.push(flux);
-            if let Some(m) = mask {
-                masks.push(m);
+            for result in results {
+                let (flux, mask, ivar) = result?;
+                fluxes.push(flux);
+                if let Some(m) = mask {
+                    masks.push(m);
+                }
+                if let Some(i) = ivar {
+                    ivars.push(i);
+                }
             }
-            if let Some(i) = ivar {
-                ivars.push(i);
+
+            if fluxes.is_empty() {
+                return Err(PyValueError::new_err("No valid samples found"));
             }
-        }
 
-        if fluxes.is_empty() {
-            return Err(PyValueError::new_err("No valid samples found"));
-        }
+            // 将结果堆叠为 4D 数组
+            let flux_views: Vec<_> = fluxes.iter().map(|a| a.view()).collect();
+            let flux_4d = ndarray::stack(Axis(0), &flux_views)
+                .map_err(|e| PyValueError::new_err(format!("Stack error: {}", e)))?;
 
-        // 将结果堆叠为 4D 数组
-        let flux_views: Vec<_> = fluxes.iter().map(|a| a.view()).collect();
-        let flux_4d = ndarray::stack(Axis(0), &flux_views)
-            .map_err(|e| PyValueError::new_err(format!("Stack error: {}", e)))?;
+            let mask_4d = if !masks.is_empty() && masks.len() == fluxes.len() {
+                let mask_views: Vec<_> = masks.iter().map(|a| a.view()).collect();
+                Some(
+                    ndarray::stack(Axis(0), &mask_views)
+                        .map_err(|e| PyValueError::new_err(format!("Stack error: {}", e)))?,
+                )
+            } else {
+                None
+            };
 
-        let mask_4d = if !masks.is_empty() && masks.len() == fluxes.len() {
-            let mask_views: Vec<_> = masks.iter().map(|a| a.view()).collect();
-            Some(
-                ndarray::stack(Axis(0), &mask_views)
-                    .map_err(|e| PyValueError::new_err(format!("Stack error: {}", e)))?,
-            )
-        } else {
-            None
-        };
+            let ivar_4d = if !ivars.is_empty() && ivars.len() == fluxes.len() {
+                let ivar_views: Vec<_> = ivars.iter().map(|a| a.view()).collect();
+                Some(
+                    ndarray::stack(Axis(0), &ivar_views)
+                        .map_err(|e| PyValueError::new_err(format!("Stack error: {}", e)))?,
+                )
+            } else {
+                None
+            };
 
-        let ivar_4d = if !ivars.is_empty() && ivars.len() == fluxes.len() {
-            let ivar_views: Vec<_> = ivars.iter().map(|a| a.view()).collect();
-            Some(
-                ndarray::stack(Axis(0), &ivar_views)
-                    .map_err(|e| PyValueError::new_err(format!("Stack error: {}", e)))?,
-            )
-        } else {
-            None
-        };
+            Ok((flux_4d, mask_4d, ivar_4d))
+        })?;
 
         // 转换为 PyArray (零拷贝)
         Ok((
@@ -374,6 +389,8 @@ impl AstroImageReader {
     }
 
     /// 读取单个样本 (返回 numpy 数组)
+    ///
+    /// 注意: 调用期间内部会释放 GIL。
     pub fn read_single<'py>(
         &self,
         py: Python<'py>,
@@ -387,12 +404,19 @@ impl AstroImageReader {
             .get_example_addr(index as usize)
             .ok_or_else(|| MsirError::IndexOutOfBounds(index))?;
 
-        let (flux, mask, ivar) = self.read_single_example(&addr.0, addr.1)?;
-
-        // 添加 batch 维度
-        let flux_4d = flux.insert_axis(Axis(0));
-        let mask_4d = mask.map(|m| m.insert_axis(Axis(0)));
-        let ivar_4d = ivar.map(|i| i.insert_axis(Axis(0)));
+        // zarr 读取为纯 Rust I/O，释放 GIL；insert_axis 属于零成本视图操作，顺带一起放入闭包。
+        let (flux_4d, mask_4d, ivar_4d) = py.detach(|| -> PyResult<(
+            Array4<f32>,
+            Option<Array4<bool>>,
+            Option<Array4<f32>>,
+        )> {
+            let (flux, mask, ivar) = self.read_single_example(&addr.0, addr.1)?;
+            Ok((
+                flux.insert_axis(Axis(0)),
+                mask.map(|m| m.insert_axis(Axis(0))),
+                ivar.map(|i| i.insert_axis(Axis(0))),
+            ))
+        })?;
 
         Ok((
             flux_4d.into_pyarray(py),
