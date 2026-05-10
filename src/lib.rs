@@ -216,22 +216,22 @@ impl AstroImageReader {
     /// 创建新的 AstroImageReader 实例
     ///
     /// Args:
-    ///     path: zarr 数据集的根路径，支持本地路径和 `oss://` URL。
+    ///     zarr_root_path: zarr 数据集的根路径，支持本地路径和 `oss://` URL。
     ///     crop_size: 裁剪大小 (默认 96)
     ///     disable_mask: 是否禁用 mask 读取 (默认 False)
     ///     disable_ivar: 是否禁用 ivar 读取 (默认 False)
     ///     max_chunk_size: 最大切片大小，用于将大索引区间切分 (默认 5000)
     #[new]
-    #[pyo3(signature = (path, crop_size=96, disable_mask=false, disable_ivar=false, max_chunk_size=5000))]
+    #[pyo3(signature = (zarr_root_path, crop_size=96, disable_mask=false, disable_ivar=false, max_chunk_size=5000))]
     pub fn new(
         py: Python<'_>,
-        path: &str,
+        zarr_root_path: &str,
         crop_size: usize,
         disable_mask: bool,
         disable_ivar: bool,
         max_chunk_size: usize,
     ) -> PyResult<Self> {
-        let zarr_root_path = path.trim_end_matches('/').to_string();
+        let zarr_root_path = zarr_root_path.trim_end_matches('/').to_string();
 
         // 构建索引涉及远程/本地 I/O，释放 GIL 以允许其他 Python 线程并发执行。
         let (index, subsets, total_samples, num_channels) =
@@ -317,18 +317,13 @@ impl AstroImageReader {
             Option<Array4<bool>>,
             Option<Array4<f32>>,
         )> {
-            // 预先收集所有需要读取的样本地址
-            let addrs: Vec<Option<(String, usize)>> = idx_slice
-                .iter()
-                .map(|&idx| self.get_example_addr(idx as usize))
-                .collect();
-
-            // 并行读取所有样本
-            let results: Vec<PyResult<(Array3<f32>, Option<Array3<bool>>, Option<Array3<f32>>)>> = addrs
-                .into_par_iter()
-                .map(|addr| match addr {
+            // 并行读取所有样本：地址解析与 zarr 读取在同一条并行管线中完成，
+            // 避免中间 Vec<Option<...>> 的一次性分配。
+            let results: Vec<PyResult<(Array3<f32>, Option<Array3<bool>>, Option<Array3<f32>>)>> = idx_slice
+                .par_iter()
+                .map(|&idx| match self.get_example_addr(idx as usize) {
                     Some((subset_path, local_idx)) => self.read_single_example(&subset_path, local_idx),
-                    None => Err(MsirError::IndexOutOfBounds(-1).into()),
+                    None => Err(MsirError::IndexOutOfBounds(idx).into()),
                 })
                 .collect();
 
