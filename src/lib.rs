@@ -196,7 +196,7 @@ pub struct AstroImageReader {
     /// zarr 数据集根路径（本地路径或 oss:// URL，原样保存）。
     zarr_root_path: String,
     /// interval tree 索引
-    index: Arc<Lapper<usize, IntervalData>>,
+    index: Lapper<usize, IntervalData>,
     /// 子集列表 (用于遍历)
     subsets: Vec<String>,
     /// 裁剪大小
@@ -239,7 +239,7 @@ impl AstroImageReader {
 
         Ok(AstroImageReader {
             zarr_root_path,
-            index: Arc::new(index),
+            index,
             subsets,
             crop_size,
             disable_mask,
