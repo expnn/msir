@@ -1,5 +1,6 @@
 use ndarray::{Array3, Array4, Axis};
 use numpy::{IntoPyArray, PyArray1, PyArray4, PyReadonlyArray1};
+use pyo3::types::PyList;
 use opendal::{Operator, services::S3};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::prelude::*;
@@ -422,6 +423,9 @@ impl AstroImageReader {
 
     /// 获取样本的地址 (subset_path, local_idx)
     pub fn get_addr(&self, index: i64) -> Option<(String, usize)> {
+        if index < 0 {
+            return None;
+        }
         self.get_example_addr(index as usize)
     }
 
@@ -438,6 +442,78 @@ impl AstroImageReader {
             .map(|iv| iv.start as i64)
             .collect();
         results.into_pyarray(py)
+    }
+
+    /// 收集样本 ID
+    ///
+    /// 训练模型时，会将数据分配到不同的进程（GPU）进行训练，每个进程需要读取不同的数据子集。
+    /// 本方法根据进程 rank 和进程总数，计算出每个进程需要读取的样本 ID 范围。
+    ///
+    /// Args:
+    ///     rank: 进程 rank
+    ///     world_size: 进程总数
+    ///
+    /// Returns:
+    ///     list[range]: 每个元素为一个 Python range 对象
+    pub fn collect_example_ids<'py>(
+        &self,
+        py: Python<'py>,
+        rank: usize,
+        world_size: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let builtins = py.import("builtins")?;
+        let range_type = builtins.getattr("range")?;
+        let list = PyList::empty(py);
+        for iv in self.index.iter() {
+            let start = iv.start;
+            let end = iv.stop;
+            // Python: range(start, end)[rank::world_size] == range(start + rank, end, world_size)
+            let shard_start = start + rank;
+            if shard_start < end {
+                let r = range_type.call1((shard_start, end, world_size))?;
+                list.append(r)?;
+            }
+        }
+        Ok(list)
+    }
+
+    /// 估算分片后的批次数量
+    ///
+    /// Args:
+    ///     batch_size: 批次大小
+    ///     world_size: 总进程数
+    ///     num_workers: 每个进程的 worker 数
+    ///
+    /// Returns:
+    ///     int: 最小分片的批次数量
+    pub fn estimate_sharded_batches(&self, batch_size: usize, world_size: usize, num_workers: usize) -> usize {
+        let total_slots = world_size * num_workers;
+        let mut sizes = vec![0usize; total_slots];
+
+        for rank in 0..world_size {
+            for worker in 0..num_workers {
+                for iv in self.index.iter() {
+                    let start = iv.start;
+                    let end = iv.stop;
+                    // range(start, end)[rank::world_size] 的长度
+                    let shard_start = start + rank;
+                    if shard_start >= end {
+                        continue;
+                    }
+                    let shard_len = (end - shard_start + world_size - 1) / world_size;
+                    // 再按 worker 分片: range(0, shard_len)[worker::num_workers]
+                    let worker_start = worker;
+                    if worker_start >= shard_len {
+                        continue;
+                    }
+                    let worker_len = (shard_len - worker_start + num_workers - 1) / num_workers;
+                    sizes[rank * num_workers + worker] += worker_len;
+                }
+            }
+        }
+
+        let min_size = sizes.iter().copied().min().unwrap_or(0);
+        min_size / batch_size
     }
 }
 
