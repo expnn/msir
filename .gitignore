@@ -3,6 +3,7 @@
 .ruff_cache
 /.envrc
 /.envrc.private
+/uv.lock
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
