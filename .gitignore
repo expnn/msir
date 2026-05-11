@@ -3,7 +3,6 @@
 .ruff_cache
 /.envrc
 /.envrc.private
-/Cargo.lock
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
