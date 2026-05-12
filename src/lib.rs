@@ -1,4 +1,4 @@
-use ndarray::{Array3, Array4, Axis};
+use ndarray::{Array3, Axis};
 use numpy::{IntoPyArray, PyArray1, PyArray4, PyReadonlyArray1};
 use pyo3::types::PyList;
 use opendal::{Operator, services::S3};
@@ -22,6 +22,16 @@ use zarrs_opendal::AsyncOpendalStore;
 
 // noinspection HttpUrlsUsage
 const DEFAULT_OSS_ENDPOINT: &str = "http://oss-cn-hangzhou-zjy-d01-a.res.cloud.zhejianglab.com";
+
+type Example<'py> = PyResult<(
+    Bound<'py, PyArray4<f32>>,
+    Option<Bound<'py, PyArray4<bool>>>,
+    Option<Bound<'py, PyArray4<f32>>>,
+)>;
+
+type ExampleArray3 = PyResult<(Array3<f32>, Option<Array3<bool>>, Option<Array3<f32>>)>;
+type IndexType = PyResult<(Lapper<usize, IntervalData>, Vec<String>, usize, usize)>;
+
 
 #[derive(Error, Debug)]
 pub enum MsirError {
@@ -154,7 +164,7 @@ fn build_store(path: &str) -> PyResult<ReadableStore> {
             // opendal 的 services-oss 仅适用于阿里云 OSS 原生协议，对 S3 兼容 endpoint 请求
             // 会成功建立连接但返回空数据。因此统一用 services-s3。
             let mut builder = S3::default()
-                .bucket(&bucket)
+                .bucket(bucket)
                 .endpoint(&endpoint)
                 .root(&root)
                 // opendal S3 要求 region 字段。对于非 AWS 的 S3 兼容存储，region 仅用于签名，
@@ -303,50 +313,39 @@ impl AstroImageReader {
         &self,
         py: Python<'py>,
         indices: PyReadonlyArray1<'py, i64>,
-    ) -> PyResult<(
-        Bound<'py, PyArray4<f32>>,
-        Option<Bound<'py, PyArray4<bool>>>,
-        Option<Bound<'py, PyArray4<f32>>>,
-    )> {
+    ) -> Example<'py> {
         // &[i64] 指向 numpy 底层 C 缓冲区，满足 Send + Sync + Ungil，可直接跨
         // detach 边界使用；调用方需遵守上方 doc 中“不得并发修改 indices”的约定。
         let idx_slice: &[i64] = indices.as_slice()?;
+        let batch_size = idx_slice.len();
 
         // 并行 I/O + ndarray::stack 均为纯 Rust 工作，无需 GIL，整体放入 detach 闭包。
-        let (flux_4d, mask_4d, ivar_4d) = py.detach(|| -> PyResult<(
-            Array4<f32>,
-            Option<Array4<bool>>,
-            Option<Array4<f32>>,
-        )> {
-            // 并行读取所有样本：地址解析与 zarr 读取在同一条并行管线中完成，
-            // 避免中间 Vec<Option<...>> 的一次性分配。
-            let results: Vec<PyResult<(Array3<f32>, Option<Array3<bool>>, Option<Array3<f32>>)>> = idx_slice
+        let (flux_4d, mask_4d, ivar_4d) = py.detach(|| -> PyResult<_> {
+            // 并行读取所有样本，collect 保序 + 短路错误，再一趟 fold 拆分三字段。
+            // 注：rayon 的 collect 对 indexed parallel iterator 保证与输入同序。
+            let (fluxes, masks, ivars) = idx_slice
                 .par_iter()
-                .map(|&idx| match self.get_example_addr(idx as usize) {
-                    Some((subset_path, local_idx)) => self.read_single_example(&subset_path, local_idx),
-                    None => Err(MsirError::IndexOutOfBounds(idx).into()),
+                .map(|&idx| {
+                    let (subset_path, local_idx) = self
+                        .get_example_addr(idx as usize)
+                        .ok_or_else(|| PyErr::from(MsirError::IndexOutOfBounds(idx)))?;
+                    self.read_single_example(&subset_path, local_idx)
                 })
-                .collect();
-
-            // 收集有效结果
-            let mut fluxes: Vec<Array3<f32>> = Vec::with_capacity(results.len());
-            let mut masks: Vec<Array3<bool>> = Vec::with_capacity(results.len());
-            let mut ivars: Vec<Array3<f32>> = Vec::with_capacity(results.len());
-
-            for result in results {
-                let (flux, mask, ivar) = result?;
-                fluxes.push(flux);
-                if let Some(m) = mask {
-                    masks.push(m);
-                }
-                if let Some(i) = ivar {
-                    ivars.push(i);
-                }
-            }
-
-            if fluxes.is_empty() {
-                return Err(PyValueError::new_err("No valid samples found"));
-            }
+                .collect::<PyResult<Vec<_>>>()?
+                .into_iter()
+                .fold(
+                    (
+                        Vec::with_capacity(batch_size),
+                        if self.disable_mask { Vec::new() } else { Vec::with_capacity(batch_size) },
+                        if self.disable_ivar { Vec::new() } else { Vec::with_capacity(batch_size) },
+                    ),
+                    |(mut fs, mut ms, mut is), (f, m, i)| {
+                        fs.push(f);
+                        if let Some(m) = m { ms.push(m); }
+                        if let Some(i) = i { is.push(i); }
+                        (fs, ms, is)
+                    },
+                );
 
             // 将结果堆叠为 4D 数组
             let flux_views: Vec<_> = fluxes.iter().map(|a| a.view()).collect();
@@ -391,21 +390,13 @@ impl AstroImageReader {
         &self,
         py: Python<'py>,
         index: i64,
-    ) -> PyResult<(
-        Bound<'py, PyArray4<f32>>,
-        Option<Bound<'py, PyArray4<bool>>>,
-        Option<Bound<'py, PyArray4<f32>>>,
-    )> {
+    ) -> Example<'py> {
         let addr = self
             .get_example_addr(index as usize)
-            .ok_or_else(|| MsirError::IndexOutOfBounds(index))?;
+            .ok_or(MsirError::IndexOutOfBounds(index))?;
 
         // zarr 读取为纯 Rust I/O，释放 GIL；insert_axis 属于零成本视图操作，顺带一起放入闭包。
-        let (flux_4d, mask_4d, ivar_4d) = py.detach(|| -> PyResult<(
-            Array4<f32>,
-            Option<Array4<bool>>,
-            Option<Array4<f32>>,
-        )> {
+        let (flux_4d, mask_4d, ivar_4d) = py.detach(|| -> PyResult<_> {
             let (flux, mask, ivar) = self.read_single_example(&addr.0, addr.1)?;
             Ok((
                 flux.insert_axis(Axis(0)),
@@ -500,13 +491,13 @@ impl AstroImageReader {
                     if shard_start >= end {
                         continue;
                     }
-                    let shard_len = (end - shard_start + world_size - 1) / world_size;
+                    let shard_len = (end - shard_start).div_ceil(world_size);
                     // 再按 worker 分片: range(0, shard_len)[worker::num_workers]
                     let worker_start = worker;
                     if worker_start >= shard_len {
                         continue;
                     }
-                    let worker_len = (shard_len - worker_start + num_workers - 1) / num_workers;
+                    let worker_len = (shard_len - worker_start).div_ceil(num_workers);
                     sizes[rank * num_workers + worker] += worker_len;
                 }
             }
@@ -522,7 +513,7 @@ impl AstroImageReader {
     fn build_index(
         zarr_root_path: &str,
         max_chunk_size: usize,
-    ) -> PyResult<(Lapper<usize, IntervalData>, Vec<String>, usize, usize)> {
+    ) -> IndexType {
         let store = build_store(zarr_root_path)?;
         let root = Group::open(store.clone(), "/")
             .map_err(|e| PyValueError::new_err(format!("Failed to open root group: {}", e)))?;
@@ -544,7 +535,7 @@ impl AstroImageReader {
             let subset_name = full_path
                 .trim_start_matches('/')
                 .split('/')
-                .last()
+                .next_back()
                 .unwrap_or("")
                 .to_string();
             if subset_name.is_empty() {
@@ -622,7 +613,7 @@ impl AstroImageReader {
         &self,
         subset_path: &str,
         local_idx: usize,
-    ) -> PyResult<(Array3<f32>, Option<Array3<bool>>, Option<Array3<f32>>)> {
+    ) -> ExampleArray3 {
         let store = build_store(&self.zarr_root_path)?;
 
         let flux_path = format!("/{}/flux", subset_path);
