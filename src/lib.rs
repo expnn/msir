@@ -1,9 +1,9 @@
-use ndarray::{Array3, Axis};
-use numpy::{IntoPyArray, PyArray1, PyArray4, PyReadonlyArray1};
-use pyo3::types::PyList;
+use ndarray::{Array3, Array4, Axis};
+use numpy::{IntoPyArray, PyArray4, PyReadonlyArray1};
 use opendal::{Operator, services::S3};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use rayon::prelude::*;
 use rust_lapper::{Interval, Lapper};
 use std::env;
@@ -17,7 +17,9 @@ use zarrs::array_subset::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
 use zarrs::group::Group;
 use zarrs::storage::ReadableListableStorageTraits;
-use zarrs::storage::storage_adapter::async_to_sync::{AsyncToSyncBlockOn, AsyncToSyncStorageAdapter};
+use zarrs::storage::storage_adapter::async_to_sync::{
+    AsyncToSyncBlockOn, AsyncToSyncStorageAdapter,
+};
 use zarrs_opendal::AsyncOpendalStore;
 
 // noinspection HttpUrlsUsage
@@ -30,15 +32,21 @@ type Example<'py> = PyResult<(
 )>;
 
 type ExampleArray3 = PyResult<(Array3<f32>, Option<Array3<bool>>, Option<Array3<f32>>)>;
-type IndexType = PyResult<(Lapper<usize, IntervalData>, Vec<String>, usize, usize)>;
-
+type BlockResult = PyResult<(Array4<f32>, Option<Array4<bool>>, Option<Array4<f32>>)>;
+type IndexType = PyResult<(
+    ReadableStore,
+    Lapper<usize, IntervalData>,
+    Vec<String>,
+    usize,
+    usize,
+)>;
 
 #[derive(Error, Debug)]
 pub enum MsirError {
     #[error("Zarr error: {0}")]
     Zarr(String),
     #[error("Index out of bounds: {0}")]
-    IndexOutOfBounds(i64),
+    IndexOutOfBounds(usize),
     #[error("Invalid data shape: {0}")]
     InvalidShape(String),
     #[error("IO error: {0}")]
@@ -90,7 +98,12 @@ impl AsyncToSyncBlockOn for TokioBlockOn {
 
 /// zarrs 同步可读 + 可列举的统一 store 类型别名。
 /// `child_groups` 需要 `ListableStorageTraits`，所以这里采用组合 trait。
-type ReadableStore = Arc<dyn ReadableListableStorageTraits>;
+///
+/// 显式追加 `Send + Sync`：store 会作为 `AstroImageReader` 的字段，并在
+/// `read_batch` 内通过 `rayon::par_iter` 跨线程共享访问；同时 `#[pyclass]`
+/// 也要求结构体所有字段满足 `Send`。`FilesystemStore` 和经
+/// `AsyncToSyncStorageAdapter` 包装后的 `AsyncOpendalStore` 均满足该 bound。
+type ReadableStore = Arc<dyn ReadableListableStorageTraits + Send + Sync>;
 
 /// 根据 path 字符串构建一个 zarrs 同步可读 store。
 ///
@@ -102,21 +115,28 @@ fn build_store(path: &str) -> PyResult<ReadableStore> {
     // 先识别是否为 OSS URL；非 URL 形式（绝对/相对本地路径）走 FilesystemStore。
     let parsed = match Url::parse(path) {
         Ok(u) => u,
-        Err(ParseError::RelativeUrlWithoutBase) => {
-            match Url::parse(&format!("file://{}", path)) {
-                Ok(u) => u,
-                Err(e) => return Err(PyValueError::new_err(format!("Invalid URL: {path:?}. Reason: {e}"))),
+        Err(ParseError::RelativeUrlWithoutBase) => match Url::parse(&format!("file://{}", path)) {
+            Ok(u) => u,
+            Err(e) => {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid URL: {path:?}. Reason: {e}"
+                )));
             }
         },
-        Err(e) => return Err(PyValueError::new_err(format!("Invalid URL: {path:?}. Reason: {e}"))),
+        Err(e) => {
+            return Err(PyValueError::new_err(format!(
+                "Invalid URL: {path:?}. Reason: {e}"
+            )));
+        }
     };
 
     let scheme = parsed.scheme();
     match scheme {
         "file" => {
             let local_path = parsed.path();
-            let store = FilesystemStore::new(local_path)
-                .map_err(|e| PyValueError::new_err(format!("Failed to open filesystem store: {}", e)))?;
+            let store = FilesystemStore::new(local_path).map_err(|e| {
+                PyValueError::new_err(format!("Failed to open filesystem store: {}", e))
+            })?;
             Ok(Arc::new(store))
         }
         "oss" | "http" | "https" => {
@@ -185,7 +205,10 @@ fn build_store(path: &str) -> PyResult<ReadableStore> {
             let sync_store = AsyncToSyncStorageAdapter::new(async_store, TokioBlockOn);
             Ok(Arc::new(sync_store))
         }
-        other => Err(PyValueError::new_err(format!("unsupported scheme {:?} for AstroImageReader path", other))),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported scheme {:?} for AstroImageReader path",
+            other
+        ))),
     }
 }
 
@@ -204,8 +227,12 @@ type IvType = Interval<usize, IntervalData>;
 /// 使用 zarrs 库高效读取 zarr 格式的天文图像数据。
 #[pyclass]
 pub struct AstroImageReader {
-    /// zarr 数据集根路径（本地路径或 oss:// URL，原样保存）。
-    zarr_root_path: String,
+    // /// zarr 数据集根路径（本地路径或 oss:// URL，原样保存）。
+    // zarr_root_path: String,
+    /// 共享的 zarrs 同步 store。构造时建立一次，全生命周期复用，避免每次
+    /// `read_single_example` 都重建 `FilesystemStore` / opendal `Operator`
+    /// 及其底层 HTTP 连接池。
+    store: ReadableStore,
     /// interval tree 索引
     index: Lapper<usize, IntervalData>,
     /// 子集列表 (用于遍历)
@@ -220,6 +247,10 @@ pub struct AstroImageReader {
     num_channels: usize,
     /// 总样本数
     total_samples: usize,
+    /// 块读取粒度: 每次 I/O 读取的连续样本数。
+    /// 当 > 1 时，`read_batch` 接收的每个 index 代表一个 block 的起始全局索引，
+    /// 单次 `retrieve_array_subset` 覆盖 [start..start+read_block_size] 的 N 范围。
+    read_block_size: usize,
 }
 
 #[pymethods]
@@ -233,7 +264,7 @@ impl AstroImageReader {
     ///     disable_ivar: 是否禁用 ivar 读取 (默认 False)
     ///     max_chunk_size: 最大切片大小，用于将大索引区间切分 (默认 5000)
     #[new]
-    #[pyo3(signature = (zarr_root_path, crop_size=96, disable_mask=false, disable_ivar=false, max_chunk_size=5000))]
+    #[pyo3(signature = (zarr_root_path, crop_size=96, disable_mask=false, disable_ivar=false, max_chunk_size=5000, read_block_size=1))]
     pub fn new(
         py: Python<'_>,
         zarr_root_path: &str,
@@ -241,15 +272,21 @@ impl AstroImageReader {
         disable_mask: bool,
         disable_ivar: bool,
         max_chunk_size: usize,
+        read_block_size: usize,
     ) -> PyResult<Self> {
+        if read_block_size == 0 {
+            return Err(PyValueError::new_err("read_block_size must be >= 1"));
+        }
+
         let zarr_root_path = zarr_root_path.trim_end_matches('/').to_string();
 
         // 构建索引涉及远程/本地 I/O，释放 GIL 以允许其他 Python 线程并发执行。
-        let (index, subsets, total_samples, num_channels) =
+        // 同时把 build_index 内部已创建的 store 取出复用，避免后续读取时重建。
+        let (store, index, subsets, total_samples, num_channels) =
             py.detach(|| Self::build_index(&zarr_root_path, max_chunk_size))?;
 
         Ok(AstroImageReader {
-            zarr_root_path,
+            store,
             index,
             subsets,
             crop_size,
@@ -257,6 +294,7 @@ impl AstroImageReader {
             disable_ivar,
             num_channels,
             total_samples,
+            read_block_size,
         })
     }
 
@@ -298,8 +336,12 @@ impl AstroImageReader {
 
     /// 批量读取样本
     ///
+    /// 当 `read_block_size > 1` 时，indices 中每个值代表一个 block 的起始全局索引，
+    /// 实际输出的 batch_size = indices.len() * read_block_size。
+    /// 当 `read_block_size == 1` 时，行为与传统逐样本读取等价。
+    ///
     /// Args:
-    ///     indices: 样本索引数组 (numpy int64 array)
+    ///     indices: block 起始索引数组 (numpy int64 array)
     ///
     /// Returns:
     ///     tuple: (flux, mask, ivar)
@@ -312,68 +354,124 @@ impl AstroImageReader {
     pub fn read_batch<'py>(
         &self,
         py: Python<'py>,
-        indices: PyReadonlyArray1<'py, i64>,
+        indices: PyReadonlyArray1<'py, usize>,
     ) -> Example<'py> {
-        // &[i64] 指向 numpy 底层 C 缓冲区，满足 Send + Sync + Ungil，可直接跨
-        // detach 边界使用；调用方需遵守上方 doc 中“不得并发修改 indices”的约定。
-        let idx_slice: &[i64] = indices.as_slice()?;
-        let batch_size = idx_slice.len();
+        let idx_slice: &[usize] = indices.as_slice()?;
+        let num_blocks = idx_slice.len();
 
-        // 并行 I/O + ndarray::stack 均为纯 Rust 工作，无需 GIL，整体放入 detach 闭包。
-        let (flux_4d, mask_4d, ivar_4d) = py.detach(|| -> PyResult<_> {
-            // 并行读取所有样本，collect 保序 + 短路错误，再一趟 fold 拆分三字段。
-            // 注：rayon 的 collect 对 indexed parallel iterator 保证与输入同序。
-            let (fluxes, masks, ivars) = idx_slice
-                .par_iter()
-                .map(|&idx| {
-                    let (subset_path, local_idx) = self
-                        .get_example_addr(idx as usize)
-                        .ok_or_else(|| PyErr::from(MsirError::IndexOutOfBounds(idx)))?;
-                    self.read_single_example(&subset_path, local_idx)
-                })
-                .collect::<PyResult<Vec<_>>>()?
-                .into_iter()
-                .fold(
-                    (
-                        Vec::with_capacity(batch_size),
-                        if self.disable_mask { Vec::new() } else { Vec::with_capacity(batch_size) },
-                        if self.disable_ivar { Vec::new() } else { Vec::with_capacity(batch_size) },
-                    ),
-                    |(mut fs, mut ms, mut is), (f, m, i)| {
-                        fs.push(f);
-                        if let Some(m) = m { ms.push(m); }
-                        if let Some(i) = i { is.push(i); }
-                        (fs, ms, is)
-                    },
-                );
+        // 并行 I/O + ndarray::concatenate 均为纯 Rust 工作，无需 GIL。
+        let (flux_4d, mask_4d, ivar_4d) =
+            py.detach(|| -> PyResult<_> {
+                // 并行读取所有 block，collect 保序 + 短路错误。
+                let (flux_blocks, mask_blocks, ivar_blocks) = idx_slice
+                    .par_iter()
+                    .map(|&block_start| {
+                        let (subset_path, local_idx) = self
+                            .get_example_addr(block_start)
+                            .ok_or_else(|| PyErr::from(MsirError::IndexOutOfBounds(block_start)))?;
+                        self.read_block_examples(subset_path, local_idx)
+                    })
+                    .collect::<PyResult<Vec<_>>>()?
+                    .into_iter()
+                    .fold(
+                        (
+                            Vec::with_capacity(num_blocks),
+                            if self.disable_mask {
+                                Vec::new()
+                            } else {
+                                Vec::with_capacity(num_blocks)
+                            },
+                            if self.disable_ivar {
+                                Vec::new()
+                            } else {
+                                Vec::with_capacity(num_blocks)
+                            },
+                        ),
+                        |(mut fs, mut ms, mut is), (f, m, i)| {
+                            fs.push(f);
+                            if let Some(m) = m {
+                                ms.push(m);
+                            }
+                            if let Some(i) = i {
+                                is.push(i);
+                            }
+                            (fs, ms, is)
+                        },
+                    );
 
-            // 将结果堆叠为 4D 数组
-            let flux_views: Vec<_> = fluxes.iter().map(|a| a.view()).collect();
-            let flux_4d = ndarray::stack(Axis(0), &flux_views)
-                .map_err(|e| PyValueError::new_err(format!("Stack error: {}", e)))?;
+                // 沿 axis 0 拼接所有 block
+                let flux_views: Vec<_> = flux_blocks.iter().map(|f| f.view()).collect();
+                let flux_4d = ndarray::concatenate(Axis(0), &flux_views)
+                    .map_err(|e| PyValueError::new_err(format!("Concatenate error: {}", e)))?;
 
-            let mask_4d = if !masks.is_empty() && masks.len() == fluxes.len() {
-                let mask_views: Vec<_> = masks.iter().map(|a| a.view()).collect();
-                Some(
-                    ndarray::stack(Axis(0), &mask_views)
-                        .map_err(|e| PyValueError::new_err(format!("Stack error: {}", e)))?,
-                )
-            } else {
-                None
-            };
+                let mask_4d = if !self.disable_mask {
+                    let mask_views: Vec<_> =
+                        mask_blocks.iter().map(|m| m.view()).collect::<Vec<_>>();
 
-            let ivar_4d = if !ivars.is_empty() && ivars.len() == fluxes.len() {
-                let ivar_views: Vec<_> = ivars.iter().map(|a| a.view()).collect();
-                Some(
-                    ndarray::stack(Axis(0), &ivar_views)
-                        .map_err(|e| PyValueError::new_err(format!("Stack error: {}", e)))?,
-                )
-            } else {
-                None
-            };
+                    if mask_views.len() == flux_blocks.len() {
+                        Some(ndarray::concatenate(Axis(0), &mask_views).map_err(|e| {
+                            PyValueError::new_err(format!("Concatenate error: {}", e))
+                        })?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
-            Ok((flux_4d, mask_4d, ivar_4d))
-        })?;
+                let ivar_4d = if !self.disable_ivar {
+                    let ivar_views: Vec<_> =
+                        ivar_blocks.iter().map(|i| i.view()).collect::<Vec<_>>();
+                    if ivar_views.len() == flux_blocks.len() {
+                        Some(ndarray::concatenate(Axis(0), &ivar_views).map_err(|e| {
+                            PyValueError::new_err(format!("Concatenate error: {}", e))
+                        })?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let flux_shape = flux_4d.shape();
+                if flux_shape.len() != 4 {
+                    return Err(PyValueError::new_err("Flux must be 4-dimensional"));
+                }
+
+                if let Some(mask_4d_) = &mask_4d {
+                    let mask_shape = mask_4d_.shape();
+                    if mask_shape.len() != 4 {
+                        return Err(PyValueError::new_err("Mask must be 4-dimensional"));
+                    }
+
+                    let batch_size = flux_shape[0];
+                    let num_channels = flux_shape[1];
+                    let height = flux_shape[2];
+                    let width = flux_shape[3];
+
+                    if mask_shape[0] != batch_size
+                        || (mask_shape[1] != num_channels && mask_shape[1] != 1)
+                        || mask_shape[2] != height
+                        || mask_shape[3] != width
+                    {
+                        return Err(PyValueError::new_err(format!(
+                            "Mask shape ({mask_shape:?}) mismatch with flux ({flux_shape:?})"
+                        )));
+                    }
+                }
+
+                if let Some(ivar_4d_) = &ivar_4d {
+                    let ivar_shape = ivar_4d_.shape();
+
+                    if ivar_shape != flux_shape {
+                        return Err(PyValueError::new_err(format!(
+                            "IVar shape ({ivar_shape:?}) mismatch with flux ({flux_shape:?})"
+                        )));
+                    }
+                }
+
+                Ok((flux_4d, mask_4d, ivar_4d))
+            })?;
 
         // 转换为 PyArray (零拷贝)
         Ok((
@@ -386,18 +484,13 @@ impl AstroImageReader {
     /// 读取单个样本 (返回 numpy 数组)
     ///
     /// 注意: 调用期间内部会释放 GIL。
-    pub fn read_single<'py>(
-        &self,
-        py: Python<'py>,
-        index: i64,
-    ) -> Example<'py> {
-        let addr = self
-            .get_example_addr(index as usize)
-            .ok_or(MsirError::IndexOutOfBounds(index))?;
-
+    pub fn read_example<'py>(&self, py: Python<'py>, index: usize) -> Example<'py> {
         // zarr 读取为纯 Rust I/O，释放 GIL；insert_axis 属于零成本视图操作，顺带一起放入闭包。
         let (flux_4d, mask_4d, ivar_4d) = py.detach(|| -> PyResult<_> {
-            let (flux, mask, ivar) = self.read_single_example(&addr.0, addr.1)?;
+            let addr = self
+                .get_example_addr(index)
+                .ok_or(MsirError::IndexOutOfBounds(index))?;
+            let (flux, mask, ivar) = self.read_single_example(addr.0, addr.1)?;
             Ok((
                 flux.insert_axis(Axis(0)),
                 mask.map(|m| m.insert_axis(Axis(0))),
@@ -413,107 +506,106 @@ impl AstroImageReader {
     }
 
     /// 获取样本的地址 (subset_path, local_idx)
-    pub fn get_addr(&self, index: i64) -> Option<(String, usize)> {
-        if index < 0 {
-            return None;
-        }
-        self.get_example_addr(index as usize)
+    #[inline]
+    pub fn get_addr(&self, index: usize) -> Option<(String, usize)> {
+        self.get_example_addr(index)
+            .map(|(subset, local_idx)| (subset.to_owned(), local_idx))
     }
 
-    /// 查询索引范围内的所有 interval
-    pub fn query_intervals<'py>(
-        &self,
-        py: Python<'py>,
-        start: usize,
-        end: usize,
-    ) -> Bound<'py, PyArray1<i64>> {
-        let results: Vec<i64> = self
-            .index
-            .find(start, end)
-            .map(|iv| iv.start as i64)
-            .collect();
-        results.into_pyarray(py)
-    }
-
-    /// 收集样本 ID
+    /// 按 block 粒度收集样本 ID。
     ///
-    /// 训练模型时，会将数据分配到不同的进程（GPU）进行训练，每个进程需要读取不同的数据子集。
-    /// 本方法根据进程 rank 和进程总数，计算出每个进程需要读取的样本 ID 范围。
+    /// 每个返回的 ID 代表连续 `block_size` 个样本的起始全局索引。
+    /// 子集尾部不足 `block_size` 的样本将被丢弃。
     ///
     /// Args:
     ///     rank: 进程 rank
     ///     world_size: 进程总数
+    ///     block_size: 块大小 (= read_block_size)
     ///
     /// Returns:
-    ///     list[range]: 每个元素为一个 Python range 对象
-    pub fn collect_example_ids<'py>(
+    ///     list[range]: 每个元素为 block 起始索引的 range
+    pub fn collect_block_ids<'py>(
         &self,
         py: Python<'py>,
         rank: usize,
         world_size: usize,
     ) -> PyResult<Bound<'py, PyList>> {
+        let block_size = self.read_block_size;
         let builtins = py.import("builtins")?;
         let range_type = builtins.getattr("range")?;
         let list = PyList::empty(py);
         for iv in self.index.iter() {
             let start = iv.start;
             let end = iv.stop;
-            // Python: range(start, end)[rank::world_size] == range(start + rank, end, world_size)
-            let shard_start = start + rank;
-            if shard_start < end {
-                let r = range_type.call1((shard_start, end, world_size))?;
+            let num_samples = end - start;
+            let num_blocks = num_samples / block_size;
+            if num_blocks == 0 {
+                continue;
+            }
+            let aligned_end = start + num_blocks * block_size;
+            // 以 block 为单位交错分配给各 rank，步长为 world_size * block_size
+            let shard_start = start + rank * block_size;
+            if shard_start < aligned_end {
+                let step = world_size * block_size;
+                let r = range_type.call1((shard_start as i64, aligned_end as i64, step as i64))?;
                 list.append(r)?;
             }
         }
         Ok(list)
     }
 
-    /// 估算分片后的批次数量
+    /// 估算分片后的批次数量（block 粒度版本）
+    ///
+    /// 遍历所有 rank，计算每个 rank 分到的 block 数，取最小值后除以
+    /// 每 batch 需要的 block 数 (= batch_size / block_size)，保证所有
+    /// rank 的 batch 数一致，避免 DDP 死锁。
+    ///
+    /// 当 `block_size == 1` 时退化为逐样本的 estimate。
     ///
     /// Args:
     ///     batch_size: 批次大小
     ///     world_size: 总进程数
-    ///     num_workers: 每个进程的 worker 数
+    ///     block_size: 块大小 (= read_block_size)
     ///
     /// Returns:
-    ///     int: 最小分片的批次数量
-    pub fn estimate_sharded_batches(&self, batch_size: usize, world_size: usize, num_workers: usize) -> usize {
-        let total_slots = world_size * num_workers;
-        let mut sizes = vec![0usize; total_slots];
+    ///     int: 所有 rank 中最小的批次数量
+    pub fn estimate_sharded_batches(&self, batch_size: usize, world_size: usize) -> usize {
+        let block_size = self.read_block_size;
+        let blocks_per_batch = batch_size / block_size;
+        if blocks_per_batch == 0 {
+            return 0;
+        }
+        let mut sizes = vec![0usize; world_size];
 
-        for rank in 0..world_size {
-            for worker in 0..num_workers {
-                for iv in self.index.iter() {
-                    let start = iv.start;
-                    let end = iv.stop;
-                    // range(start, end)[rank::world_size] 的长度
-                    let shard_start = start + rank;
-                    if shard_start >= end {
-                        continue;
-                    }
-                    let shard_len = (end - shard_start).div_ceil(world_size);
-                    // 再按 worker 分片: range(0, shard_len)[worker::num_workers]
-                    let worker_start = worker;
-                    if worker_start >= shard_len {
-                        continue;
-                    }
-                    let worker_len = (shard_len - worker_start).div_ceil(num_workers);
-                    sizes[rank * num_workers + worker] += worker_len;
+        for (rank, rank_size_ref) in sizes.iter_mut().enumerate() {
+            for iv in self.index.iter() {
+                let start = iv.start;
+                let end = iv.stop;
+                let num_samples = end - start;
+                let num_blocks = num_samples / block_size;
+                if num_blocks == 0 {
+                    continue;
                 }
+                let aligned_end = start + num_blocks * block_size;
+                let shard_start = start + rank * block_size;
+                if shard_start >= aligned_end {
+                    continue;
+                }
+                // range(shard_start, aligned_end, world_size * block_size) 的长度
+                let step = world_size * block_size;
+                let rank_blocks = (aligned_end - shard_start).div_ceil(step);
+                *rank_size_ref += rank_blocks;
             }
         }
 
-        let min_size = sizes.iter().copied().min().unwrap_or(0);
-        min_size / batch_size
+        let min_blocks = sizes.iter().copied().min().unwrap_or(0);
+        min_blocks / blocks_per_batch
     }
 }
 
 impl AstroImageReader {
     /// 构建索引
-    fn build_index(
-        zarr_root_path: &str,
-        max_chunk_size: usize,
-    ) -> IndexType {
+    fn build_index(zarr_root_path: &str, max_chunk_size: usize) -> IndexType {
         let store = build_store(zarr_root_path)?;
         let root = Group::open(store.clone(), "/")
             .map_err(|e| PyValueError::new_err(format!("Failed to open root group: {}", e)))?;
@@ -595,26 +687,23 @@ impl AstroImageReader {
         let total_samples = start_idx;
         let lapper = Lapper::new(intervals);
 
-        Ok((lapper, subsets, total_samples, num_channels))
+        Ok((store, lapper, subsets, total_samples, num_channels))
     }
 
     /// 获取样本地址
-    fn get_example_addr(&self, example_id: usize) -> Option<(String, usize)> {
+    fn get_example_addr(&self, example_id: usize) -> Option<(&str, usize)> {
         let mut results = self.index.find(example_id, example_id + 1);
 
         results.next().map(|interval| {
             let local_idx = example_id - interval.start + interval.val.offset;
-            (interval.val.subset_path.clone(), local_idx)
+            (interval.val.subset_path.as_ref(), local_idx)
         })
     }
 
     /// 读取单个样本
-    fn read_single_example(
-        &self,
-        subset_path: &str,
-        local_idx: usize,
-    ) -> ExampleArray3 {
-        let store = build_store(&self.zarr_root_path)?;
+    fn read_single_example(&self, subset_path: &str, local_idx: usize) -> ExampleArray3 {
+        // 直接复用构造时缓存的 store；clone 仅递增 Arc 引用计数，零开销。
+        let store = self.store.clone();
 
         let flux_path = format!("/{}/flux", subset_path);
         let flux_array = Array::open(store.clone(), &flux_path)
@@ -747,6 +836,146 @@ impl AstroImageReader {
 
         Ok((flux_3d, mask_3d, ivar_3d))
     }
+
+    /// 一次性读取同一 subset 内连续 `block_size` 个样本。
+    ///
+    /// 与 `read_single_example` 的关键区别:
+    /// - `ArraySubset` 的 N 维范围为 `[start..start+block_size]`
+    /// - 返回 4D 数组 (block_size, C, H, W)
+    /// - 单次 `retrieve_array_subset` 调用覆盖整个 block
+    fn read_block_examples(&self, subset_path: &str, start_local_idx: usize) -> BlockResult {
+        let store = &self.store;
+        let block_size = self.read_block_size;
+
+        let flux_path = format!("/{}/flux", subset_path);
+        let flux_array = Array::open(store.clone(), &flux_path)
+            .map_err(|e| PyValueError::new_err(format!("Failed to open flux: {}", e)))?;
+
+        // 计算中心裁剪范围
+        let shape = flux_array.shape();
+        if shape.len() != 4 {
+            return Err(PyValueError::new_err(format!(
+                "Expected flux array to have 4 dimensions (N, C, H, W), got {}",
+                shape.len()
+            )));
+        }
+        let height = shape[2] as usize;
+        let width = shape[3] as usize;
+        if height < self.crop_size || width < self.crop_size {
+            return Err(PyValueError::new_err(format!(
+                "Image size ({}x{}) is smaller than crop_size ({})",
+                height, width, self.crop_size
+            )));
+        }
+        let start_y = (height - self.crop_size) / 2;
+        let start_x = (width - self.crop_size) / 2;
+
+        // 读取 flux: (block_size, C, H, W)
+        let flux_subset = ArraySubset::new_with_ranges(&[
+            start_local_idx as u64..(start_local_idx + block_size) as u64,
+            0..shape[1],
+            start_y as u64..(start_y + self.crop_size) as u64,
+            start_x as u64..(start_x + self.crop_size) as u64,
+        ]);
+
+        let flux_data: ndarray::ArrayD<f32> = flux_array
+            .retrieve_array_subset_ndarray(&flux_subset)
+            .map_err(|e| PyValueError::new_err(format!("Failed to read flux: {}", e)))?;
+
+        let flux_4d = flux_data
+            .into_shape_with_order(ndarray::IxDyn(&[
+                block_size,
+                self.num_channels,
+                self.crop_size,
+                self.crop_size,
+            ]))
+            .map_err(|e| PyValueError::new_err(format!("Reshape error: {}", e)))?
+            .into_dimensionality::<ndarray::Ix4>()
+            .map_err(|e| PyValueError::new_err(format!("Dimension error: {}", e)))?;
+
+        // 读取 mask
+        let mask_4d = if !self.disable_mask {
+            let mask_path = format!("/{}/mask", subset_path);
+            let mask_array = Array::open(store.clone(), &mask_path)
+                .map_err(|e| PyValueError::new_err(format!("Failed to open mask: {}", e)))?;
+
+            let mask_shape = mask_array.shape();
+            let (mask_subset, num_mask_channels) = if mask_shape.len() == 4 {
+                (
+                    ArraySubset::new_with_ranges(&[
+                        start_local_idx as u64..(start_local_idx + block_size) as u64,
+                        0..mask_shape[1],
+                        start_y as u64..(start_y + self.crop_size) as u64,
+                        start_x as u64..(start_x + self.crop_size) as u64,
+                    ]),
+                    mask_shape[1] as usize,
+                )
+            } else {
+                (
+                    ArraySubset::new_with_ranges(&[
+                        start_local_idx as u64..(start_local_idx + block_size) as u64,
+                        start_y as u64..(start_y + self.crop_size) as u64,
+                        start_x as u64..(start_x + self.crop_size) as u64,
+                    ]),
+                    1,
+                )
+            };
+
+            let mask_data: ndarray::ArrayD<bool> = mask_array
+                .retrieve_array_subset_ndarray(&mask_subset)
+                .map_err(|e| PyValueError::new_err(format!("Failed to read mask: {}", e)))?;
+
+            let mask_4d = mask_data
+                .into_shape_with_order(ndarray::IxDyn(&[
+                    block_size,
+                    num_mask_channels,
+                    self.crop_size,
+                    self.crop_size,
+                ]))
+                .map_err(|e| PyValueError::new_err(format!("Reshape error: {}", e)))?
+                .into_dimensionality::<ndarray::Ix4>()
+                .map_err(|e| PyValueError::new_err(format!("Dimension error: {}", e)))?;
+
+            Some(mask_4d)
+        } else {
+            None
+        };
+
+        // 读取 ivar
+        let ivar_4d = if !self.disable_ivar {
+            let ivar_path = format!("/{}/ivar", subset_path);
+            let ivar_array = Array::open(store.clone(), &ivar_path)
+                .map_err(|e| PyValueError::new_err(format!("Failed to open ivar: {}", e)))?;
+
+            let ivar_subset = ArraySubset::new_with_ranges(&[
+                start_local_idx as u64..(start_local_idx + block_size) as u64,
+                0..shape[1],
+                start_y as u64..(start_y + self.crop_size) as u64,
+                start_x as u64..(start_x + self.crop_size) as u64,
+            ]);
+
+            let ivar_data: ndarray::ArrayD<f32> = ivar_array
+                .retrieve_array_subset_ndarray(&ivar_subset)
+                .map_err(|e| PyValueError::new_err(format!("Failed to read ivar: {}", e)))?;
+
+            let ivar_4d = ivar_data
+                .into_shape_with_order(ndarray::IxDyn(&[
+                    block_size,
+                    self.num_channels,
+                    self.crop_size,
+                    self.crop_size,
+                ]))
+                .map_err(|e| PyValueError::new_err(format!("Reshape error: {}", e)))?
+                .into_dimensionality::<ndarray::Ix4>()
+                .map_err(|e| PyValueError::new_err(format!("Dimension error: {}", e)))?;
+
+            Some(ivar_4d)
+        } else {
+            None
+        };
+
+        Ok((flux_4d, mask_4d, ivar_4d))
+    }
 }
 
 /// Python 模块定义。
@@ -774,14 +1003,11 @@ mod msir {
     #[pymodule_init]
     fn init_module(_m: &Bound<'_, PyModule>) -> PyResult<()> {
         let rt = Runtime::new().map_err(|e| {
-            PyImportError::new_err(format!(
-                "failed to create tokio runtime for msir: {}",
-                e
-            ))
+            PyImportError::new_err(format!("failed to create tokio runtime for msir: {}", e))
         })?;
-        super::RUNTIME.set(rt).map_err(|_| {
-            PyImportError::new_err("msir tokio runtime is already initialized")
-        })?;
+        super::RUNTIME
+            .set(rt)
+            .map_err(|_| PyImportError::new_err("msir tokio runtime is already initialized"))?;
         Ok(())
     }
 }
