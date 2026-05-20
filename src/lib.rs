@@ -4,7 +4,6 @@ use opendal::{Operator, services::S3};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
-use rayon::prelude::*;
 use rust_lapper::{Interval, Lapper};
 use std::env;
 use std::future::Future;
@@ -364,7 +363,7 @@ impl AstroImageReader {
             py.detach(|| -> PyResult<_> {
                 // 并行读取所有 block，collect 保序 + 短路错误。
                 let (flux_blocks, mask_blocks, ivar_blocks) = idx_slice
-                    .par_iter()
+                    .iter()
                     .map(|&block_start| {
                         let (subset_path, local_idx) = self
                             .get_example_addr(block_start)
