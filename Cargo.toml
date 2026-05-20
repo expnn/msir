@@ -19,3 +19,6 @@ opendal = { version = "0.56", features = ["services-s3"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 url = "2"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+rayon = "1.12.0"

@@ -991,6 +991,27 @@ mod msir {
     #[pymodule_export]
     use super::AstroImageReader;
 
+    /// 配置 zarrs 内部并发参数。
+    ///
+    /// Args:
+    ///     chunk_concurrent_minimum: chunk 级最小并发数。为 None 时保持不变。
+    ///     codec_concurrent_target: codec 编解码总并发上限。为 None 时保持不变。
+    #[pyfunction]
+    #[pyo3(signature = (chunk_concurrent_minimum=None, codec_concurrent_target=None))]
+    fn configure(chunk_concurrent_minimum: Option<usize>, codec_concurrent_target: Option<usize>) {
+        use zarrs::config::global_config_mut;
+
+        let mut cfg = global_config_mut();
+        if let Some(v) = chunk_concurrent_minimum {
+            cfg.set_chunk_concurrent_minimum(v);
+            log::debug!(target: "msir", "zarrs.chunk_concurrent_minimum set to {v}");
+        }
+        if let Some(v) = codec_concurrent_target {
+            cfg.set_codec_concurrent_target(v);
+            log::debug!(target: "msir", "zarrs.codec_concurrent_target set to {v}");
+        }
+    }
+
     /// 模块初始化：在此处创建 tokio runtime。
     ///
     /// - 初始化只发生一次，且发生在 Python `import msir` 的过程中；
@@ -1001,6 +1022,40 @@ mod msir {
     ///   （见 PyO3 FAQ）。
     #[pymodule_init]
     fn init_module(_m: &Bound<'_, PyModule>) -> PyResult<()> {
+        // 使用 env_logger 让本扩展库的日志有一个专属开关，不依赖
+        // 全局 RUST_LOG，也不引入 pyo3-log。Python 进程设置环境变量
+        // `MSIR_LOG`（如 `MSIR_LOG=debug`）后，msir 内部的 log 调用才会
+        // 在 stderr 输出；未设置时默认为 `off`，什么也不打印。
+        // `try_init` 重复调用会返回 Err，不应阻塞模块加载。
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::new()
+                .filter_or("MSIR_LOG", "off")
+                .write_style("MSIR_LOG_STYLE"),
+        )
+        .try_init();
+
+        // 根据 LOCAL_WORLD_SIZE 环境变量按比例缩小 zarrs 的 codec 总并发上限，
+        // 避免 DataLoader 多 worker 场景下各 worker 之和超出物理核心数。
+        // 解析失败或值为 0 时回退到 1（不做缩放）。
+        let local_world_size: usize = std::env::var("LOCAL_WORLD_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1);
+
+        // 读取 zarrs 当前（即默认）codec_concurrent_target，再除以 LOCAL_WORLD_SIZE；
+        // 至少保留 1 以避免被设置为 0（zarrs 中 0 表示不限制，并非我们想要的语义）。
+        let default_target = rayon::current_num_threads();
+        let scaled_target = (default_target / local_world_size).max(1);
+        log::debug!(
+            target: "msir",
+            "init: LOCAL_WORLD_SIZE={}, zarrs default codec_concurrent_target={}, scaled to {}",
+            local_world_size,
+            default_target,
+            scaled_target,
+        );
+
+        configure(Some(2), Some(scaled_target));
         let rt = Runtime::new().map_err(|e| {
             PyImportError::new_err(format!("failed to create tokio runtime for msir: {}", e))
         })?;
