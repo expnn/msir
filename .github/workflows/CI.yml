@@ -189,10 +189,28 @@ jobs:
         with:
           subject-path: 'wheels-*/*'
       - name: Install uv
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        # if: ${{ startsWith(github.ref, 'refs/tags/') }}  # TODO: 恢复 PyPI 发布时取消注释
+        if: false
         uses: astral-sh/setup-uv@v7
       - name: Publish to PyPI
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        # if: ${{ startsWith(github.ref, 'refs/tags/') }}  # TODO: 恢复 PyPI 发布时取消注释
+        if: false
         run: uv publish 'wheels-*/*'
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+      - name: Create GitHub Release
+        # 仅在 tag 推送时创建 Release；workflow_dispatch 手动触发不创建。
+        # 未存在同名 Release 时会新建；已存在则追加/更新 assets。
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          # 上传所有上游 job 上传的 wheels-* artifact 中的文件
+          # （包含 linux / musllinux / windows / macos wheels 及 sdist）。
+          files: 'wheels-*/*'
+          # 根据两个 tag 之间的 commit 自动生成 Release notes。
+          generate_release_notes: true
+          # 任何 wheels-* glob 未命中时不报错，遵循 experimental
+          # matrix 项可能构建失败、不产生 artifact 的设计。
+          fail_on_unmatched_files: false
+          # 通过标签自动触发，预发布标识
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
