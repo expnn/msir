@@ -350,6 +350,11 @@ impl AstroImageReader {
     ///
     /// 注意: 调用期间内部会释放 GIL，调用方必须保证在本次调用返回前不从其他
     /// 线程修改 `indices` 数组，否则行为未定义。
+    #[pyo3(signature = (indices: "np.ndarray")
+        -> "tuple[np.ndarray, \
+                  np.ndarray | None, \
+                  np.ndarray | None] \
+            | None")]
     pub fn read_batch<'py>(
         &self,
         py: Python<'py>,
@@ -483,6 +488,11 @@ impl AstroImageReader {
     /// 读取单个样本 (返回 numpy 数组)
     ///
     /// 注意: 调用期间内部会释放 GIL。
+    #[pyo3(signature = (index: "np.uintp | int")
+        -> "tuple[np.ndarray, \
+                  np.ndarray | None, \
+                  np.ndarray | None] \
+            | None")]
     pub fn read_example<'py>(&self, py: Python<'py>, index: usize) -> Example<'py> {
         // zarr 读取为纯 Rust I/O，释放 GIL；insert_axis 属于零成本视图操作，顺带一起放入闭包。
         let (flux_4d, mask_4d, ivar_4d) = py.detach(|| -> PyResult<_> {
@@ -977,10 +987,10 @@ impl AstroImageReader {
     }
 }
 
-/// Python 模块定义。
-///
-/// 使用声明式模块语法（`#[pymodule] mod ...`），以便通过 `#[pymodule_init]`
-/// 在模块导入阶段完成 tokio runtime 的一次性初始化。
+// Python 模块定义。
+//
+// 使用声明式模块语法（`#[pymodule] mod ...`），以便通过 `#[pymodule_init]`
+// 在模块导入阶段完成 tokio runtime 的一次性初始化。
 #[pymodule]
 mod msir {
     use pyo3::exceptions::PyImportError;
