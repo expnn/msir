@@ -41,7 +41,6 @@ class AstroImageReader:
         Args:
             rank: 进程 rank
             world_size: 进程总数
-            block_size: 块大小 (= read_block_size)
 
         Returns:
             list[range]: 每个元素为 block 起始索引的 range
@@ -74,7 +73,6 @@ class AstroImageReader:
         Args:
             batch_size: 批次大小
             world_size: 总进程数
-            block_size: 块大小 (= read_block_size)
 
         Returns:
             int: 所有 rank 中最小的批次数量

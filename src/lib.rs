@@ -15,9 +15,13 @@ use zarrs::array::Array;
 use zarrs::array_subset::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
 use zarrs::group::Group;
-use zarrs::storage::ReadableListableStorageTraits;
 use zarrs::storage::storage_adapter::async_to_sync::{
     AsyncToSyncBlockOn, AsyncToSyncStorageAdapter,
+};
+use zarrs::storage::{
+    byte_range::ByteRangeIterator, ListableStorageTraits, MaybeBytes, MaybeBytesIterator,
+    ReadableListableStorageTraits, ReadableStorageTraits, StorageError, StoreKey, StoreKeys,
+    StoreKeysPrefixes, StorePrefix,
 };
 use zarrs_opendal::AsyncOpendalStore;
 
@@ -103,6 +107,103 @@ impl AsyncToSyncBlockOn for TokioBlockOn {
 /// 也要求结构体所有字段满足 `Send`。`FilesystemStore` 和经
 /// `AsyncToSyncStorageAdapter` 包装后的 `AsyncOpendalStore` 均满足该 bound。
 type ReadableStore = Arc<dyn ReadableListableStorageTraits + Send + Sync>;
+
+/// 防御性 store wrapper，修复部分 S3 兼容存储（如阿里云 OSS）在 ListObjectsV2
+/// 时返回根自身作为 common_prefix 导致 zarrs_opendal 的 `StorePrefix::try_from("/")` 失败的问题。
+///
+/// 仅重写 `list_dir`：使用 opendal `Operator` 直接列出，过滤掉 `path == "/"` 的条目。
+/// 其他方法全部委托给内层 store。
+struct OssStoreWrapper {
+    inner: Arc<dyn ReadableListableStorageTraits + Send + Sync>,
+    operator: Operator,
+    runtime: &'static Runtime,
+}
+
+impl ReadableStorageTraits for OssStoreWrapper {
+    fn get(&self, key: &StoreKey) -> Result<MaybeBytes, StorageError> {
+        self.inner.get(key)
+    }
+
+    fn get_partial_many<'a>(
+        &'a self,
+        key: &StoreKey,
+        byte_ranges: ByteRangeIterator<'a>,
+    ) -> Result<MaybeBytesIterator<'a>, StorageError> {
+        self.inner.get_partial_many(key, byte_ranges)
+    }
+
+    fn size_key(&self, key: &StoreKey) -> Result<Option<u64>, StorageError> {
+        self.inner.size_key(key)
+    }
+
+    fn supports_get_partial(&self) -> bool {
+        self.inner.supports_get_partial()
+    }
+}
+
+impl ListableStorageTraits for OssStoreWrapper {
+    fn list(&self) -> Result<StoreKeys, StorageError> {
+        self.inner.list()
+    }
+
+    fn list_prefix(&self, prefix: &StorePrefix) -> Result<StoreKeys, StorageError> {
+        self.inner.list_prefix(prefix)
+    }
+
+    fn list_dir(&self, prefix: &StorePrefix) -> Result<StoreKeysPrefixes, StorageError> {
+        let entries = self
+            .runtime
+            .block_on(async {
+                self.operator
+                    .list_with(prefix.as_str())
+                    .recursive(false)
+                    .await
+            })
+            .map_err(|e| StorageError::Other(e.to_string()))?;
+
+        let mut prefixes = Vec::new();
+        let mut keys = Vec::new();
+
+        for entry in &entries {
+            let path = entry.path();
+            // 防御性过滤：跳过根自身条目（部分 S3 兼容存储如 OSS 会返回根自身 "/"）
+            if path == "/" {
+                continue;
+            }
+            match entry.metadata().mode() {
+                opendal::EntryMode::FILE => {
+                    if let Ok(key) = StoreKey::try_from(path) {
+                        keys.push(key);
+                    }
+                }
+                opendal::EntryMode::DIR => {
+                    if let Ok(prefix_entry) = StorePrefix::try_from(path) {
+                        if &prefix_entry != prefix {
+                            prefixes.push(prefix_entry);
+                        }
+                    }
+                }
+                opendal::EntryMode::Unknown => {}
+            }
+        }
+
+        keys.sort();
+        prefixes.sort();
+        Ok(StoreKeysPrefixes::new(keys, prefixes))
+    }
+
+    fn size_prefix(&self, prefix: &StorePrefix) -> Result<u64, StorageError> {
+        self.inner.size_prefix(prefix)
+    }
+
+    fn size(&self) -> Result<u64, StorageError> {
+        self.inner.size()
+    }
+}
+
+// OssStoreWrapper 实现了 ReadableStorageTraits + ListableStorageTraits + 'static，
+// 因此 zarrs_storage 中的 blanket impl 自动为它提供 ReadableListableStorageTraits 实现。
+// 所有字段（Arc<dyn ...>, Operator, &'static Runtime）均为 Send + Sync，无需 unsafe impl。
 
 /// 根据 path 字符串构建一个 zarrs 同步可读 store。
 ///
@@ -199,10 +300,45 @@ fn build_store(path: &str) -> PyResult<ReadableStore> {
             let op = Operator::new(builder)
                 .map_err(|e| PyValueError::new_err(format!("Failed to build S3 operator: {}", e)))?
                 .finish();
-            // runtime 已在模块初始化阶段创建，这里无需再次校验。
-            let async_store = Arc::new(AsyncOpendalStore::new(op));
+
+            // 凭证预检：验证连接和权限，避免后续 zarrs 操作因凭证错误返回空结果
+            // 而报出令人困惑的 "group metadata is missing"。
+            let rt = runtime();
+            let check = rt.block_on(async { op.list_with("/").recursive(false).await });
+            match check {
+                Err(e) if e.kind() == opendal::ErrorKind::PermissionDenied => {
+                    return Err(PyValueError::new_err(format!(
+                        "OSS access denied: {}. \
+                         Check OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET environment variables \
+                         or credentials in the URL (oss://key:secret@host/bucket/path)",
+                        e
+                    )));
+                }
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                    return Err(PyValueError::new_err(format!(
+                        "OSS bucket or path not found: {}. \
+                         Check the bucket name and path in the URL",
+                        e
+                    )));
+                }
+                Err(e) => {
+                    return Err(PyValueError::new_err(format!(
+                        "OSS connection failed: {}. \
+                         Check endpoint, credentials, and network connectivity",
+                        e
+                    )));
+                }
+                _ => {}
+            }
+
+            let async_store = Arc::new(AsyncOpendalStore::new(op.clone()));
             let sync_store = AsyncToSyncStorageAdapter::new(async_store, TokioBlockOn);
-            Ok(Arc::new(sync_store))
+            let wrapper = OssStoreWrapper {
+                inner: Arc::new(sync_store),
+                operator: op,
+                runtime: runtime(),
+            };
+            Ok(Arc::new(wrapper))
         }
         other => Err(PyValueError::new_err(format!(
             "unsupported scheme {:?} for AstroImageReader path",
