@@ -1,6 +1,6 @@
 [package]
 name = "msir"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -15,7 +15,9 @@ ndarray = "0.16"
 rust-lapper = "1.2.0"
 zarrs = { version = "0.22.10", features = ["ndarray"] }
 zarrs_opendal = "0.11"
-opendal = { version = "0.56", features = ["services-s3"] }
+opendal = { version = "0.56", features = ["services-s3", "services-oss"] }
+http = "1"
+bytes = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 url = "2"

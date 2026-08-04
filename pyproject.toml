@@ -11,3 +11,72 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
+
+[dependency-groups]
+dev = [
+    "numpy>=1.24.4",
+    "s3fs>=2024.10.0",
+    "zarr>=2.16.1",
+]
+
+[tool.ruff]
+preview = true
+src = ["src"]
+extend-exclude = [".jj", "./cache", "./data", ".qoder/**", "docs/**"]
+line-length = 120
+
+[tool.ruff.lint]
+extend-select = [
+    "B",
+    "BLE",
+    "C4",
+    "E",
+    "ERA",
+    "I",
+    "ICN",
+    "INP",
+    "ISC",
+    "N",
+    "NPY",
+    "PGH",
+    "PIE",
+    # "PTH",  # 该规则集会对 os.path.abspath(), os.path.join() 等经常使用且非常熟悉的函数的使用报警.
+    "Q",
+    "RET",
+    "RSE",
+    "RUF",
+    "S",
+    "SIM",
+    "T20",
+    "TCH",
+    "TID",
+    "YTT",
+]
+
+extend-ignore = [
+    "INP001",  # 允许隐式的 package. 避免创建很多空的 __init__.py 文件. 目前我没有发现不使用 __init__.py 文件有什么问题
+    "RUF001",
+    "RUF002",
+    "RET505",  # 允许多余的 else. 个人觉得 if-else 匹配，代码层级更清楚，更容易判断程序的逻辑完备性.
+    "ERA001",  # 允许注释掉的代码
+    "S101",  # 允许使用 assert
+    "RUF013", # 允许隐式的可选值.
+    "T201", # 允许 print 函数. 这个对于实验性代码非常有用.
+    "T203", # 允许 pprint 函数. 这个对于实验性代码非常有用.
+    "RUF003", # 注释里允许中文逗号.
+    "E501", # Line too long, 按理不应该忽略该规则, 但是貌似它对中文的长度检测不正确, 会导致大量误报. 因此手工依赖 IDE 而非 该规则.
+]
+
+[tool.ruff.format]
+# 使用空格缩进
+indent-style = "space"
+# 强制在多行括号列表的末尾添加逗号，这会触发 Ruff 的换行逻辑
+skip-magic-trailing-comma = false
+docstring-code-format = true
+
+[tool.pyright]
+typeCheckingMode = "basic"
+reportUnusedImport = "warning"
+include = ["src", "tests", "benches"]
+pythonVersion = "3.12"
+reportMissingImports = true

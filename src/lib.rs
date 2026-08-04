@@ -1,6 +1,7 @@
 use ndarray::{Array3, Array4, Axis};
 use numpy::{IntoPyArray, PyArray4, PyReadonlyArray1};
-use opendal::{Operator, services::S3};
+use opendal::{services::{Oss, S3}, Buffer, Operator};
+use opendal::raw::HttpClient;
 use pyo3::exceptions::{PyIOError, PyIndexError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -24,9 +25,6 @@ use zarrs::storage::{
     StoreKeysPrefixes, StorePrefix,
 };
 use zarrs_opendal::AsyncOpendalStore;
-
-// noinspection HttpUrlsUsage
-const DEFAULT_OSS_ENDPOINT: &str = "http://oss-cn-hangzhou-zjy-d01-a.res.cloud.zhejianglab.com";
 
 type Example<'py> = PyResult<(
     Bound<'py, PyArray4<f32>>,
@@ -205,14 +203,304 @@ impl ListableStorageTraits for OssStoreWrapper {
 // 因此 zarrs_storage 中的 blanket impl 自动为它提供 ReadableListableStorageTraits 实现。
 // 所有字段（Arc<dyn ...>, Operator, &'static Runtime）均为 Send + Sync，无需 unsafe impl。
 
+/// 解析后的对象存储 URL 信息（纯解析，不访问网络/环境变量，便于单元测试）。
+struct ParsedObjectStoreUrl {
+    /// scheme：`oss` | `s3` | `http` | `https`
+    scheme: String,
+    bucket: String,
+    root: String,
+    /// URL userinfo 中的 access_key_id（若有）
+    access_key_id: Option<String>,
+    /// URL userinfo 中的 access_key_secret（若有）
+    access_key_secret: Option<String>,
+    /// `http(s)://` 时由 URL host 构成的 endpoint；`oss://`/`s3://` 为 None
+    /// （endpoint 走环境变量）
+    endpoint_from_url: Option<String>,
+}
+
+/// 纯解析对象存储 URL。`oss://`/`s3://` 取 authority 为 bucket、path 为 root；
+/// `http(s)://` 取 URL host 为 endpoint、path 首段为 bucket。失败返回描述性错误。
+fn parse_object_store_url(path: &str) -> Result<ParsedObjectStoreUrl, String> {
+    let parsed = Url::parse(path).map_err(|e| format!("Invalid URL: {path:?}. Reason: {e}"))?;
+    let scheme = parsed.scheme().to_string();
+    let access_key_id = if parsed.username().is_empty() {
+        None
+    } else {
+        Some(parsed.username().to_string())
+    };
+    let access_key_secret = parsed.password().map(|s| s.to_string());
+
+    match scheme.as_str() {
+        "oss" | "s3" => {
+            // bucket 取 authority（必填，消除 `oss:///bucket/path` 三斜杠问题）。
+            let bucket = match parsed.host_str() {
+                Some(b) if !b.is_empty() => b.to_string(),
+                _ => {
+                    return Err(format!(
+                        "{scheme}:// URL missing bucket (expected {scheme}://<bucket>/<path>)"
+                    ));
+                }
+            };
+            Ok(ParsedObjectStoreUrl {
+                scheme,
+                bucket,
+                root: parsed.path().to_string(),
+                access_key_id,
+                access_key_secret,
+                endpoint_from_url: None,
+            })
+        }
+        "http" | "https" => {
+            // endpoint 取 URL host；bucket 取 path 首段（保持既有 http(s):// 行为）。
+            let endpoint = match parsed.host_str() {
+                Some(host) if !host.is_empty() => {
+                    if let Some(port) = parsed.port() {
+                        format!("{scheme}://{}:{}", host, port)
+                    } else {
+                        format!("{scheme}://{}", host)
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "{scheme}:// URL missing host (expected {scheme}://<host>/<bucket>/<path>)"
+                    ));
+                }
+            };
+            let full_path = parsed.path().trim_start_matches('/');
+            let (bucket, root_in_bucket) = match full_path.split_once('/') {
+                Some((b, rest)) if !b.is_empty() => (b, rest),
+                _ if !full_path.is_empty() => (full_path, ""),
+                _ => {
+                    return Err(format!(
+                        "{scheme}:// URL missing bucket in path (expected {scheme}://<host>/<bucket>/<path>)"
+                    ));
+                }
+            };
+            Ok(ParsedObjectStoreUrl {
+                scheme,
+                bucket: bucket.to_string(),
+                root: format!("/{}", root_in_bucket),
+                access_key_id,
+                access_key_secret,
+                endpoint_from_url: Some(endpoint),
+            })
+        }
+        other => Err(format!("unsupported scheme {other:?} for AstroImageReader path")),
+    }
+}
+
+/// 构建对象存储（`oss://`/`s3://`/`http(s)://`）store。
+///
+/// - `oss://[user[:pass]@]<bucket>/<path>`：阿里 OSS 原生协议（opendal `Oss`），
+///   endpoint 必填，取 `OSS_ENDPOINT` 环境变量；凭证取 `OSS_ACCESS_KEY_ID` /
+///   `OSS_ACCESS_KEY_SECRET` 或 URL userinfo。
+/// - `s3://[user[:pass]@]<bucket>/<path>`：S3 协议（opendal `S3`），endpoint 可选，
+///   取 `AWS_ENDPOINT_URL`；凭证取 `AWS_*` 或 URL userinfo。
+/// - `http(s)://[user[:pass]@]<host>[:port]/<bucket>/<path>`：S3 协议，endpoint 为 URL host，
+///   凭证同 `s3://`。
+fn build_object_store(path: &str) -> PyResult<ReadableStore> {
+    let info = parse_object_store_url(path).map_err(PyValueError::new_err)?;
+    let scheme = info.scheme.as_str();
+
+    let op = if scheme == "oss" {
+        build_oss_operator(&info)?
+    } else {
+        build_s3_operator(&info)?
+    };
+
+    // 凭证预检：验证连接和权限，避免后续 zarrs 操作因凭证错误返回空结果
+    // 而报出令人困惑的 "group metadata is missing"。失败时附加协议不匹配诊断。
+    let rt = runtime();
+    let check = rt.block_on(async { op.list_with("/").recursive(false).await });
+    if let Err(e) = check {
+        return Err(build_preflight_error(&info, e));
+    }
+
+    let async_store = Arc::new(AsyncOpendalStore::new(op.clone()));
+    let sync_store = AsyncToSyncStorageAdapter::new(async_store, TokioBlockOn);
+    let wrapper = OssStoreWrapper {
+        inner: Arc::new(sync_store),
+        operator: op,
+        runtime: runtime(),
+    };
+    Ok(Arc::new(wrapper))
+}
+
+/// 构建阿里 OSS 原生协议 operator（Oss 后端固定使用 virtual-host 寻址，无需额外配置）。
+fn build_oss_operator(info: &ParsedObjectStoreUrl) -> PyResult<Operator> {
+    // OSS_ENDPOINT 必填：oss:// 的 endpoint 无法从 URL 推断（bucket 名不含 region）。
+    let endpoint = env::var("OSS_ENDPOINT").map_err(|_| {
+        PyValueError::new_err(
+            "OSS_ENDPOINT environment variable is required for oss:// URLs \
+             (e.g. OSS_ENDPOINT=https://oss-cn-hangzhou.aliyuncs.com)",
+        )
+    })?;
+    let mut builder = Oss::default()
+        .bucket(&info.bucket)
+        .endpoint(&endpoint)
+        .root(&info.root);
+    let access_key_id = info
+        .access_key_id
+        .clone()
+        .or_else(|| env::var("OSS_ACCESS_KEY_ID").ok());
+    let access_key_secret = info
+        .access_key_secret
+        .clone()
+        .or_else(|| env::var("OSS_ACCESS_KEY_SECRET").ok());
+    if let Some(k) = access_key_id.as_deref() {
+        builder = builder.access_key_id(k);
+    }
+    if let Some(s) = access_key_secret.as_deref() {
+        // 注意：Oss builder 的方法名是 access_key_secret（与 S3 的 secret_access_key 不同）。
+        builder = builder.access_key_secret(s);
+    }
+    Operator::new(builder)
+        .map_err(|e| PyValueError::new_err(format!("Failed to build OSS operator: {}", e)))
+        .map(|b| b.finish())
+}
+
+/// 构建 S3 兼容协议 operator（`s3://` 与 `http(s)://`）。
+fn build_s3_operator(info: &ParsedObjectStoreUrl) -> PyResult<Operator> {
+    let mut builder = S3::default()
+        .bucket(&info.bucket)
+        .root(&info.root)
+        // opendal S3 要求 region 字段。对于非 AWS 的 S3 兼容存储，region 仅用于签名，
+        // 具体值无实际意义。优先取 AWS_REGION，否则默认 "auto"。
+        .region(&env::var("AWS_REGION").unwrap_or_else(|_| "auto".to_string()));
+    // endpoint：http(s):// 用 URL host；s3:// 用 AWS_ENDPOINT_URL（可选）。
+    if let Some(ep) = &info.endpoint_from_url {
+        builder = builder.endpoint(ep);
+    } else if let Ok(ep) = env::var("AWS_ENDPOINT_URL") {
+        builder = builder.endpoint(&ep);
+    }
+    let access_key_id = info
+        .access_key_id
+        .clone()
+        .or_else(|| env::var("AWS_ACCESS_KEY_ID").ok());
+    let access_key_secret = info
+        .access_key_secret
+        .clone()
+        .or_else(|| env::var("AWS_SECRET_ACCESS_KEY").ok());
+    if let Some(k) = access_key_id.as_deref() {
+        builder = builder.access_key_id(k);
+    }
+    if let Some(s) = access_key_secret.as_deref() {
+        builder = builder.secret_access_key(s);
+    }
+    if let Ok(t) = env::var("AWS_SESSION_TOKEN") {
+        builder = builder.session_token(&t);
+    }
+    Operator::new(builder)
+        .map_err(|e| PyValueError::new_err(format!("Failed to build S3 operator: {}", e)))
+        .map(|b| b.finish())
+}
+
+/// 预检失败时构造带诊断提示的错误。
+fn build_preflight_error(info: &ParsedObjectStoreUrl, e: opendal::Error) -> PyErr {
+    let scheme = info.scheme.as_str();
+    let (label, env_ak, env_sk) = if scheme == "oss" {
+        ("OSS", "OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET")
+    } else {
+        ("S3", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
+    };
+    let base = match e.kind() {
+        opendal::ErrorKind::PermissionDenied => format!(
+            "{label} access denied: {}. \
+             Check {env_ak} and {env_sk} environment variables \
+             or credentials in the URL ({scheme}://key:secret@bucket/path)",
+            e
+        ),
+        opendal::ErrorKind::NotFound => format!(
+            "{label} bucket or path not found: {}. \
+             Check the bucket name and path in the URL",
+            e
+        ),
+        _ => format!(
+            "{label} connection failed: {}. \
+             Check endpoint, credentials, and network connectivity",
+            e
+        ),
+    };
+    match probe_and_hint(info) {
+        Some(hint) => PyValueError::new_err(format!("{base}\n{hint}")),
+        None => PyValueError::new_err(base),
+    }
+}
+
+/// 协议不匹配诊断：向 endpoint 发一次轻量 HEAD 请求判断服务器类型，返回提示。
+/// 探测失败或无法判定时返回 None。只诊断，不切换后端。
+fn probe_and_hint(info: &ParsedObjectStoreUrl) -> Option<String> {
+    // 确定探测目标 endpoint：oss:// 用 OSS_ENDPOINT，http(s):// 用 URL host，
+    // s3:// 用 AWS_ENDPOINT_URL（缺省无法判定）。
+    let endpoint = match info.scheme.as_str() {
+        "oss" => env::var("OSS_ENDPOINT").ok()?,
+        "s3" => env::var("AWS_ENDPOINT_URL").ok()?,
+        _ => info.endpoint_from_url.clone()?,
+    };
+    let is_aliyun = probe_is_aliyun(&endpoint);
+    build_mismatch_hint(is_aliyun, &info.scheme)
+}
+
+/// 向 endpoint 发一次 HEAD 请求，判断是否为阿里 OSS
+/// （`Server: AliyunOSS` 或 `x-oss-request-id` 响应头）。失败返回 None（无法判定）。
+fn probe_is_aliyun(endpoint: &str) -> Option<bool> {
+    let rt = runtime();
+    rt.block_on(probe_is_aliyun_async(endpoint))
+}
+
+/// [probe_is_aliyun] 的异步实现，便于单测（可用独立 runtime + mock server 调用）。
+async fn probe_is_aliyun_async(endpoint: &str) -> Option<bool> {
+    let client = HttpClient::new().ok()?;
+    let req = http::Request::builder()
+        .method("HEAD")
+        .uri(endpoint)
+        .body(Buffer::default())
+        .ok()?;
+    let resp = client.send(req).await.ok()?;
+    let is_aliyun = resp
+        .headers()
+        .get("server")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase().contains("aliyunoss"))
+        .unwrap_or(false)
+        || resp.headers().contains_key("x-oss-request-id");
+    Some(is_aliyun)
+}
+
+/// 根据探测结果生成协议不匹配提示（纯函数，便于单元测试）。
+/// - `Some(true)`（阿里 OSS）且用户用了非 `oss://` → 提示改用 `oss://`
+/// - `Some(false)`（非阿里）且用户用了 `oss://` → 提示改用 `s3://`/`http(s)://`
+/// - 其他情况（匹配或无提示）→ None
+fn build_mismatch_hint(is_aliyun: Option<bool>, scheme: &str) -> Option<String> {
+    match is_aliyun {
+        None => None, // 无法判定
+        Some(true) if scheme != "oss" => Some(format!(
+            "Protocol hint: the endpoint appears to be Aliyun OSS. \
+             For the native OSS protocol, use oss://<bucket>/<path> \
+             and set the OSS_ENDPOINT environment variable."
+        )),
+        Some(false) if scheme == "oss" => Some(format!(
+            "Protocol hint: the endpoint does not appear to be Aliyun OSS. \
+             The oss:// scheme only supports the Aliyun OSS native protocol; \
+             for S3-compatible storage use s3:// or http(s)://."
+        )),
+        _ => None,
+    }
+}
+
 /// 根据 path 字符串构建一个 zarrs 同步可读 store。
 ///
-/// 支持：
+/// 支持的 URL 形式：
 /// - 本地路径（无 scheme 或 `file://`）：返回 `FilesystemStore`。
-/// - `oss://[user[:pass]@]<bucket-or-host>/<path>`：返回经 AsyncToSyncStorageAdapter 包装的
-///   `AsyncOpendalStore`，凭证、endpoint 与 [create_zarr_store] 的 Python 实现保持一致。
+/// - `oss://[user[:pass]@]<bucket>/<path>`：阿里 OSS 原生协议。
+/// - `s3://[user[:pass]@]<bucket>/<path>`：S3 协议。
+/// - `http(s)://[user[:pass]@]<host>[:port]/<bucket>/<path>`：S3 协议 + 显式 endpoint。
+///
+/// BREAKING: 旧版 `oss://<host>/<bucket>/<path>`（endpoint 在 authority）不再支持，
+/// authority 一律解释为 bucket。S3 兼容存储请改用 `http(s)://<host>/<bucket>/<path>`，
+/// 真阿里 OSS 请用 `oss://<bucket>/<path>` + `OSS_ENDPOINT` 环境变量。
 fn build_store(path: &str) -> PyResult<ReadableStore> {
-    // 先识别是否为 OSS URL；非 URL 形式（绝对/相对本地路径）走 FilesystemStore。
+    // 先识别是否为 URL；非 URL 形式（绝对/相对本地路径）走 FilesystemStore。
     let parsed = match Url::parse(path) {
         Ok(u) => u,
         Err(ParseError::RelativeUrlWithoutBase) => match Url::parse(&format!("file://{}", path)) {
@@ -230,8 +518,7 @@ fn build_store(path: &str) -> PyResult<ReadableStore> {
         }
     };
 
-    let scheme = parsed.scheme();
-    match scheme {
+    match parsed.scheme() {
         "file" => {
             let local_path = parsed.path();
             let store = FilesystemStore::new(local_path).map_err(|e| {
@@ -239,107 +526,7 @@ fn build_store(path: &str) -> PyResult<ReadableStore> {
             })?;
             Ok(Arc::new(store))
         }
-        "oss" | "http" | "https" => {
-            // 与 Python 端 create_zarr_store 的语义对齐：
-            //   - bucket 取 URL path 的第一段；
-            //   - endpoint 优先用 URL host（`<scheme>://<host>[:port]`，oss scheme 默认使用 http），
-            //     host 为空时回退到 OSS_ENDPOINT 环境变量，再回退到默认 endpoint；
-            //   - access_key_id / access_key_secret 先读 URL userinfo，再回退到环境变量。
-            let full_path = parsed.path().trim_start_matches('/');
-            let (bucket, root_in_bucket) = match full_path.split_once('/') {
-                Some((b, rest)) if !b.is_empty() => (b, rest),
-                _ if !full_path.is_empty() => (full_path, ""),
-                _ => {
-                    return Err(PyValueError::new_err(
-                        "oss:// URL missing bucket in path (expected oss://[host]/<bucket>/<path>)",
-                    ));
-                }
-            };
-
-            let access_key_id = if !parsed.username().is_empty() {
-                Some(parsed.username().to_string())
-            } else {
-                env::var("OSS_ACCESS_KEY_ID").ok()
-            };
-            let access_key_secret = parsed
-                .password()
-                .map(|s| s.to_string())
-                .or_else(|| env::var("OSS_ACCESS_KEY_SECRET").ok());
-
-            let endpoint = match parsed.host_str() {
-                Some(host) if !host.is_empty() => {
-                    // oss:// 视为未指定具体协议，默认用 http；非 oss scheme 则沿用其 scheme。
-                    let scheme = if scheme == "oss" { "http" } else { scheme };
-                    if let Some(port) = parsed.port() {
-                        format!("{}://{}:{}", scheme, host, port)
-                    } else {
-                        format!("{}://{}", scheme, host)
-                    }
-                }
-                _ => env::var("OSS_ENDPOINT").unwrap_or_else(|_| DEFAULT_OSS_ENDPOINT.to_string()),
-            };
-
-            let root = format!("/{}", root_in_bucket);
-            // 与 Python 端对齐：Python 通过 s3fs + endpoint_url 访问 OSS/内部存储，走的是 S3 兼容协议。
-            // opendal 的 services-oss 仅适用于阿里云 OSS 原生协议，对 S3 兼容 endpoint 请求
-            // 会成功建立连接但返回空数据。因此统一用 services-s3。
-            let mut builder = S3::default()
-                .bucket(bucket)
-                .endpoint(&endpoint)
-                .root(&root)
-                // opendal S3 要求 region 字段。对于非 AWS 的 S3 兼容存储，region 仅用于签名，
-                // 具体值无实际意义。优先取 AWS_REGION，否则默认 "auto"。
-                .region(&env::var("OSS_REGION").unwrap_or_else(|_| "auto".to_string()));
-            if let Some(k) = access_key_id.as_deref() {
-                builder = builder.access_key_id(k);
-            }
-            if let Some(s) = access_key_secret.as_deref() {
-                builder = builder.secret_access_key(s);
-            }
-
-            let op = Operator::new(builder)
-                .map_err(|e| PyValueError::new_err(format!("Failed to build S3 operator: {}", e)))?
-                .finish();
-
-            // 凭证预检：验证连接和权限，避免后续 zarrs 操作因凭证错误返回空结果
-            // 而报出令人困惑的 "group metadata is missing"。
-            let rt = runtime();
-            let check = rt.block_on(async { op.list_with("/").recursive(false).await });
-            match check {
-                Err(e) if e.kind() == opendal::ErrorKind::PermissionDenied => {
-                    return Err(PyValueError::new_err(format!(
-                        "OSS access denied: {}. \
-                         Check OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET environment variables \
-                         or credentials in the URL (oss://key:secret@host/bucket/path)",
-                        e
-                    )));
-                }
-                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                    return Err(PyValueError::new_err(format!(
-                        "OSS bucket or path not found: {}. \
-                         Check the bucket name and path in the URL",
-                        e
-                    )));
-                }
-                Err(e) => {
-                    return Err(PyValueError::new_err(format!(
-                        "OSS connection failed: {}. \
-                         Check endpoint, credentials, and network connectivity",
-                        e
-                    )));
-                }
-                _ => {}
-            }
-
-            let async_store = Arc::new(AsyncOpendalStore::new(op.clone()));
-            let sync_store = AsyncToSyncStorageAdapter::new(async_store, TokioBlockOn);
-            let wrapper = OssStoreWrapper {
-                inner: Arc::new(sync_store),
-                operator: op,
-                runtime: runtime(),
-            };
-            Ok(Arc::new(wrapper))
-        }
+        "oss" | "s3" | "http" | "https" => build_object_store(path),
         other => Err(PyValueError::new_err(format!(
             "unsupported scheme {:?} for AstroImageReader path",
             other
@@ -1209,5 +1396,154 @@ mod msir {
             .set(rt)
             .map_err(|_| PyImportError::new_err("msir tokio runtime is already initialized"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    // ---- URL 解析（task 2.5）----
+
+    #[test]
+    fn parse_oss_bucket_in_authority() {
+        let info = parse_object_store_url("oss://my-bucket/data/zarr/root").unwrap();
+        assert_eq!(info.scheme, "oss");
+        assert_eq!(info.bucket, "my-bucket");
+        assert_eq!(info.root, "/data/zarr/root");
+        assert!(info.endpoint_from_url.is_none());
+    }
+
+    #[test]
+    fn parse_s3_bucket_in_authority() {
+        let info = parse_object_store_url("s3://my-bucket/data/zarr/root").unwrap();
+        assert_eq!(info.scheme, "s3");
+        assert_eq!(info.bucket, "my-bucket");
+        assert_eq!(info.root, "/data/zarr/root");
+        assert!(info.endpoint_from_url.is_none());
+    }
+
+    #[test]
+    fn parse_triple_slash_rejected() {
+        // 三斜杠 `oss:///bucket/path` / `s3:///bucket/path`：空 authority → 解析期报错
+        assert!(parse_object_store_url("oss:///bucket/path").is_err());
+        assert!(parse_object_store_url("s3:///bucket/path").is_err());
+    }
+
+    #[test]
+    fn parse_old_style_oss_host_as_bucket() {
+        // 旧式 `oss://host/bucket/path`：endpoint 被当作 bucket（硬切，无兼容）
+        let info =
+            parse_object_store_url("oss://oss-cn-hangzhou.aliyuncs.com/my-bucket/root").unwrap();
+        assert_eq!(info.bucket, "oss-cn-hangzhou.aliyuncs.com");
+        assert_eq!(info.root, "/my-bucket/root");
+        assert!(info.endpoint_from_url.is_none());
+    }
+
+    #[test]
+    fn parse_userinfo_extraction() {
+        let info = parse_object_store_url("oss://key:secret@my-bucket/root").unwrap();
+        assert_eq!(info.access_key_id.as_deref(), Some("key"));
+        assert_eq!(info.access_key_secret.as_deref(), Some("secret"));
+        assert_eq!(info.bucket, "my-bucket");
+    }
+
+    #[test]
+    fn parse_http_endpoint_from_url() {
+        let info = parse_object_store_url("https://minio.local:9000/my-bucket/data/zarr").unwrap();
+        assert_eq!(info.scheme, "https");
+        assert_eq!(info.bucket, "my-bucket");
+        assert_eq!(info.root, "/data/zarr");
+        assert_eq!(
+            info.endpoint_from_url.as_deref(),
+            Some("https://minio.local:9000")
+        );
+    }
+
+    #[test]
+    fn parse_unsupported_scheme_rejected() {
+        assert!(parse_object_store_url("ftp://host/bucket/path").is_err());
+    }
+
+    // ---- 协议不匹配提示（task 5.4，纯函数分支）----
+
+    #[test]
+    fn hint_aliyun_detected_for_s3() {
+        let hint = build_mismatch_hint(Some(true), "s3").unwrap();
+        assert!(hint.contains("oss://"), "hint: {hint}");
+    }
+
+    #[test]
+    fn hint_non_aliyun_detected_for_oss() {
+        let hint = build_mismatch_hint(Some(false), "oss").unwrap();
+        assert!(hint.contains("s3://"), "hint: {hint}");
+    }
+
+    #[test]
+    fn hint_inconclusive_no_hint() {
+        // 无法判定（探测失败）→ 无提示
+        assert!(build_mismatch_hint(None, "oss").is_none());
+        assert!(build_mismatch_hint(None, "s3").is_none());
+    }
+
+    #[test]
+    fn hint_matching_no_hint() {
+        // 阿里 OSS + oss:// → 匹配，无提示
+        assert!(build_mismatch_hint(Some(true), "oss").is_none());
+        // 非阿里 + s3:// → 匹配，无提示
+        assert!(build_mismatch_hint(Some(false), "s3").is_none());
+        assert!(build_mismatch_hint(Some(false), "https").is_none());
+    }
+
+    // ---- probe 对 mock HTTP 端点（task 5.4，真实 HEAD 请求）----
+
+    #[test]
+    fn probe_detects_aliyun_oss() {
+        let (addr, handle) = start_mock_server("Server: AliyunOSS\r\nx-oss-request-id: abc123");
+        let rt = Runtime::new().unwrap();
+        let is_aliyun = rt.block_on(probe_is_aliyun_async(&format!("http://{addr}")));
+        handle.join().unwrap();
+        assert_eq!(is_aliyun, Some(true));
+    }
+
+    #[test]
+    fn probe_detects_non_aliyun() {
+        let (addr, handle) = start_mock_server("Server: MinIO");
+        let rt = Runtime::new().unwrap();
+        let is_aliyun = rt.block_on(probe_is_aliyun_async(&format!("http://{addr}")));
+        handle.join().unwrap();
+        assert_eq!(is_aliyun, Some(false));
+    }
+
+    #[test]
+    fn probe_inconclusive_when_unreachable() {
+        // 连接被拒绝 → None（无法判定）
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let rt = Runtime::new().unwrap();
+        let is_aliyun = rt.block_on(probe_is_aliyun_async(&format!("http://{addr}")));
+        assert_eq!(is_aliyun, None);
+    }
+
+    /// 起一个极简 HTTP 服务器，返回固定响应头。返回 (addr, join_handle)。
+    fn start_mock_server(resp_headers: &'static str) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                // 读请求（内容可忽略），回一个带自定义 Server 头的 200。
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!("HTTP/1.1 200 OK\r\n{resp_headers}\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(resp.as_bytes());
+                break; // 只服务一次
+            }
+        });
+        (addr, handle)
     }
 }
