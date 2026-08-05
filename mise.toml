@@ -1,0 +1,46 @@
+[tools]
+uv = "latest"
+
+[env]
+# PYTHONPATH = "{{ config_root }}/src"
+# 从 .env 加载敏感变量（WANDB_API_KEY 等），如果文件不存在则静默忽略
+# _.file = ".env"
+
+# 把 .venv/bin 加入 PATH，使  python 可直接访问
+# _.path = ".venv/bin"
+
+# source 虚拟环境，获取到正确的 PATH 环境变量和 virtualenv 环境变量
+_.source = ".venv/bin/activate"
+
+[tasks.setup]
+description = "Install the project in editable mode"
+run = [
+    "uv venv --python 3.12 --allow-existing",
+    "uv sync",
+]
+sources = ["pyproject.toml", "uv.lock"]
+
+[tasks.install]
+description = "Reinstall the package in editable mode"
+run = "uv sync"
+
+[tasks.update-deps]
+description = "Update all dependencies"
+run = "uv sync --upgrade"
+
+[tasks.clean]
+description = "Remove build artifacts and cache"
+run = """
+rm -rf build/ dist/ *.egg-info
+find . -type d -name __pycache__ -exec rm -rf '{}' + 2>/dev/null || true
+"""
+
+[tasks.distclean]
+description = "Remove build artifacts and cache"
+run = """
+rm -rf .venv/ build/ dist/ *.egg-info
+find . -type d -name __pycache__ -exec rm -rf '{}' + 2>/dev/null || true
+"""
+
+# [hooks.enter]
+# run = "uv sync --frozen"

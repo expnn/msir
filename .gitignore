@@ -4,6 +4,8 @@
 /.envrc
 /.envrc.private
 /uv.lock
+/cache
+/mise.local.toml
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
