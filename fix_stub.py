@@ -1,4 +1,4 @@
-import subprocess  # noqa: S404
+import subprocess  # ruff: ignore[suspicious-subprocess-import]
 from pathlib import Path
 
 
@@ -7,7 +7,7 @@ def main():
 
     # 1. 调用 maturin 生成原始存根，输出目标直接设为根目录 '.'
     print("正在通过 maturin 生成原始存根文件...")
-    subprocess.run(("maturin", "generate-stubs", "--out", "."), check=True)  # noqa: S607
+    subprocess.run(("maturin", "generate-stubs", "--out", "."), check=True)  # ruff: ignore[start-process-with-partial-path]
 
     # 2. 读取刚刚生成的 pyi 内容
     if stub_file.exists():

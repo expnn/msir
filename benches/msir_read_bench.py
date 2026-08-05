@@ -46,6 +46,7 @@ Usage:
   uv run python zarr_read_bench.py --store s3://default/cyc/datasets/astro-images-v2/LegacySurvey/train --output-dir ./out
   uv run python zarr_read_bench.py --store oss://my-bucket/path/to/root --output-dir ./out
 """
+
 from __future__ import annotations
 
 import argparse
@@ -57,11 +58,11 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import msir
 import numpy as np
 import zarr
 import zarr.storage
-
-import msir
+from tabulate import tabulate
 
 CROP = 96
 FULL = 160
@@ -83,7 +84,7 @@ def resolve_zarr_url(p: str) -> str:
 def local_path_of(store: str) -> Optional[Path]:
     if SCHEME_RE.match(store):
         if store.lower().startswith("file://"):
-            return Path(store[len("file://"):])
+            return Path(store[len("file://") :])
         return None
     return Path(store)
 
@@ -121,7 +122,7 @@ def detect_chunk_shape(root: Path):
             f = sub / "flux" / "zarr.json"
             if f.exists():
                 candidates.append(f)
-            for sub2 in (sub.iterdir() if sub.is_dir() else []):
+            for sub2 in sub.iterdir() if sub.is_dir() else []:
                 f = sub2 / "flux" / "zarr.json"
                 if f.exists():
                     candidates.append(f)
@@ -162,13 +163,21 @@ def detect_chunk_shape_remote(store: str):
     return None
 
 
-def make_reader(store_url: str, block_size: int, crop: int = CROP,
-                disable_ivar: bool = True, disable_mask: bool = False,
-                max_chunk: int = 5000):
+def make_reader(
+    store_url: str,
+    block_size: int,
+    crop: int = CROP,
+    disable_ivar: bool = True,
+    disable_mask: bool = False,
+    max_chunk: int = 5000,
+):
     return msir.AstroImageReader(
-        zarr_root_path=store_url, crop_size=crop,
-        disable_mask=disable_mask, disable_ivar=disable_ivar,
-        max_chunk_size=max_chunk, read_block_size=block_size,
+        zarr_root_path=store_url,
+        crop_size=crop,
+        disable_mask=disable_mask,
+        disable_ivar=disable_ivar,
+        max_chunk_size=max_chunk,
+        read_block_size=block_size,
     )
 
 
@@ -192,7 +201,7 @@ def run_epoch(reader, n: int, block: int, epoch_n: int, seed: int) -> tuple[floa
     t0 = time.perf_counter()
     per_call = max(1, 128 // block)
     for i in range(0, len(picks), per_call):
-        reader.read_batch(picks[i:i + per_call])
+        reader.read_batch(picks[i : i + per_call])
     return time.perf_counter() - t0, n_blocks * block
 
 
@@ -206,8 +215,7 @@ def directory_size(p: Optional[Path]) -> int:
     return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
 
 
-def bench_store(store: str, label: str, block, epoch_samples, seed=7331,
-                disable_ivar=True, disable_mask=False):
+def bench_store(store: str, label: str, block, epoch_samples, seed=7331, disable_ivar=True, disable_mask=False):
     store_url = resolve_zarr_url(store)
     lp = local_path_of(store)
     r = make_reader(store_url, block, disable_ivar=disable_ivar, disable_mask=disable_mask)
@@ -221,21 +229,55 @@ def bench_store(store: str, label: str, block, epoch_samples, seed=7331,
     # 单次全量读取的缓存命中占比可忽略，足以代表真实训练吞吐。
     t, epoch_n_read = run_epoch(r, n, block, epoch_n, seed)
     # decomp 解析注解（原语义）：每 block 读的 chunk 解压次数 = (block // S_s) * tiles。
-    det = (detect_chunk_shape(lp) if lp is not None else
-           (detect_chunk_shape_remote(store)
-            if store.startswith(("oss://", "s3://", "http://", "https://")) else None))
+    det = (
+        detect_chunk_shape(lp)
+        if lp is not None
+        else (
+            detect_chunk_shape_remote(store) if store.startswith(("oss://", "s3://", "http://", "https://")) else None
+        )
+    )
     S_s = int(det[0]) if det else None
     spatial = int(det[1]) if det else None
     tiles = spatial_tiles(spatial) if spatial else None
     decomp_per_block = ((block // S_s) * tiles) if (S_s and tiles) else None
-    return dict(store=store, label=label, n=n, epoch_samples=epoch_n_read,
-                read_block_size=block, epoch_s=round(t, 4),
-                S_s=S_s, spatial=spatial, decomp_per_block=decomp_per_block,
-                disk_gb=round(directory_size(lp) / 1e9, 3) if lp else None)
+    return dict(
+        store=store,
+        label=label,
+        n=n,
+        epoch_samples=epoch_n_read,
+        read_block_size=block,
+        epoch_s=round(t, 4),
+        S_s=S_s,
+        spatial=spatial,
+        decomp_per_block=decomp_per_block,
+        disk_gb=round(directory_size(lp) / 1e9, 3) if lp else None,
+    )
 
 
 def _fmt(v):
     return "n/a" if v is None else str(v)
+
+
+HEADERS = ["label", "n", "epoch_n", "epoch_s", "samp/s", "MB/s", "decomp/blk", "disk_GB"]
+# label 左对齐, 数值列右对齐; 交给 tabulate 的 colalign 强制生效(不依赖类型推断,
+# 因为单元格已预先格式化为字符串). 错误行把 ERROR 放在 epoch_s 槽, 消息放最后一列.
+COLALIGN = ("left", "right", "right", "right", "right", "right", "right", "right")
+
+
+def _table_row(fr: dict) -> list:
+    """单行结果(字符串单元), 供 tabulate 渲染终端表格与 markdown 表格共用."""
+    if "error" in fr:
+        return [fr["label"], "", "", "ERROR", "", "", "", fr["error"]]
+    return [
+        fr["label"],
+        str(fr["n"]),
+        str(fr["epoch_n"]),
+        f"{fr['med_s']:.3f}",
+        f"{fr['samp_s']:.0f}",
+        f"{fr['MB_s']:.1f}",
+        fr["decomp"],
+        fr["disk"],
+    ]
 
 
 def _derive_label(store: str) -> str:
@@ -256,6 +298,7 @@ def _remote_parts(store: str):
     NOTE: the old empty-host form oss:///<bucket>/<path> is no longer valid.
     """
     from urllib.parse import urlparse
+
     u = urlparse(store)
     if u.scheme in ("oss", "s3"):
         bucket, _, rest = u.netloc, "", u.path.lstrip("/")
@@ -280,8 +323,10 @@ def _s3fs_for_remote(store: str):
     oss:// -> OSS_* env vars (Aliyun OSS native endpoint)
     s3:// and https:// -> AWS_* env vars (S3-compatible endpoint)
     """
-    import s3fs
     from urllib.parse import urlparse
+
+    import s3fs
+
     u = urlparse(store)
     if u.scheme == "oss":
         key = os.environ.get("OSS_ACCESS_KEY_ID")
@@ -294,7 +339,10 @@ def _s3fs_for_remote(store: str):
         if u.scheme in ("http", "https"):
             endpoint = f"{u.scheme}://{u.netloc}"
     return s3fs.S3FileSystem(
-        key=key, secret=secret, endpoint_url=endpoint, anon=False,
+        key=key,
+        secret=secret,
+        endpoint_url=endpoint,
+        anon=False,
     )
 
 
@@ -313,9 +361,14 @@ def discover_stores(store, label, crop, disable_ivar, disable_mask, max_chunk):
     # container discovery via s3fs (scheme-appropriate creds/endpoint).
     if SCHEME_RE.match(store) and not store.lower().startswith("file://"):
         try:  # single? (msir parses the URL and reads scheme-appropriate env)
-            r = msir.AstroImageReader(zarr_root_path=store, crop_size=crop,
-                                      disable_mask=disable_mask, disable_ivar=disable_ivar,
-                                      max_chunk_size=max_chunk, read_block_size=32)
+            r = msir.AstroImageReader(
+                zarr_root_path=store,
+                crop_size=crop,
+                disable_mask=disable_mask,
+                disable_ivar=disable_ivar,
+                max_chunk_size=max_chunk,
+                read_block_size=32,
+            )
             _ = r.total_samples  # forces group open + make_index
             return [(store, label or _derive_label(store), None)]
         except Exception:
@@ -338,14 +391,18 @@ def discover_stores(store, label, crop, disable_ivar, disable_mask, max_chunk):
                 f"(oss:// -> OSS_ENDPOINT, OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET; "
                 f"s3:// -> AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)."
             ) from e
-        raise ValueError(
-            f"could not open {store!r} as a single zarr root, and no variant subdirs found.")
+        raise ValueError(f"could not open {store!r} as a single zarr root, and no variant subdirs found.")
     # local / file:// / other remote
     url = resolve_zarr_url(store)
     try:  # single zarr root (msir opens + make_index succeeds)?
-        r = msir.AstroImageReader(zarr_root_path=url, crop_size=crop,
-                                  disable_mask=disable_mask, disable_ivar=disable_ivar,
-                                  max_chunk_size=max_chunk, read_block_size=32)
+        r = msir.AstroImageReader(
+            zarr_root_path=url,
+            crop_size=crop,
+            disable_mask=disable_mask,
+            disable_ivar=disable_ivar,
+            max_chunk_size=max_chunk,
+            read_block_size=32,
+        )
         _ = r.total_samples
         return [(url, label or _derive_label(store), local_path_of(store))]
     except Exception:
@@ -381,55 +438,70 @@ def discover_stores(store, label, crop, disable_ivar, disable_mask, max_chunk):
                 f"failed ({type(e).__name__}: {e}). For remote reads use oss:// (msir supports "
                 f"oss:// only, not s3://); install s3fs/ossfs and set creds env vars."
             ) from e
-    raise ValueError(
-        f"could not open {store!r} as a single zarr root, and no variant subdirs found.")
+    raise ValueError(f"could not open {store!r} as a single zarr root, and no variant subdirs found.")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Portable zarr read benchmark (msir, OSS-capable, auto-discovery).")
-    ap.add_argument("--store", required=True,
-                    help="zarr root URL/path OR a container of variant roots. Local path / file:// / "
-                         "oss://<bucket>/<path> (Aliyun OSS native; reads OSS_ACCESS_KEY_ID/"
-                         "OSS_ACCESS_KEY_SECRET/OSS_ENDPOINT env) / s3://<bucket>/<path> (S3; reads "
-                         "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_ENDPOINT_URL env) / "
-                         "https://<host>/<bucket>/<path> (S3 + explicit endpoint; AWS_* env). "
-                         "Auto-detects single vs container (container = zarr group with zarr.json at root).")
+    ap.add_argument(
+        "--store",
+        required=True,
+        help="zarr root URL/path OR a container of variant roots. Local path / file:// / "
+        "oss://<bucket>/<path> (Aliyun OSS native; reads OSS_ACCESS_KEY_ID/"
+        "OSS_ACCESS_KEY_SECRET/OSS_ENDPOINT env) / s3://<bucket>/<path> (S3; reads "
+        "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_ENDPOINT_URL env) / "
+        "https://<host>/<bucket>/<path> (S3 + explicit endpoint; AWS_* env). "
+        "Auto-detects single vs container (container = zarr group with zarr.json at root).",
+    )
     ap.add_argument("--label", help="label for single-store mode (default: derived).")
     ap.add_argument("--output-dir", default=".", help="where to write results (default: CWD).")
     ap.add_argument("--run-name", default="zarr_read_bench", help="results file basename.")
     ap.add_argument("--read-block-size", type=int, default=BLOCK)
-    ap.add_argument("--epoch-samples", type=int, default=0,
-                    help="samples per epoch; 0 = full dataset. A capped epoch reads a "
-                         "random subset of the dataset.")
-    ap.add_argument("--disable-ivar", action="store_true", default=True,
-                    help="skip ivar (matches pretrain; default True).")
+    ap.add_argument(
+        "--epoch-samples",
+        type=int,
+        default=0,
+        help="samples per epoch; 0 = full dataset. A capped epoch reads a random subset of the dataset.",
+    )
+    ap.add_argument(
+        "--disable-ivar", action="store_true", default=True, help="skip ivar (matches pretrain; default True)."
+    )
     ap.add_argument("--read-ivar", dest="disable_ivar", action="store_false", help="also read ivar.")
-    ap.add_argument("--disable-mask", action="store_true", default=False,
-                    help="skip mask (default False: mask is read, matching pretrain).")
+    ap.add_argument(
+        "--disable-mask",
+        action="store_true",
+        default=False,
+        help="skip mask (default False: mask is read, matching pretrain).",
+    )
     ap.add_argument("--max-chunk-size", type=int, default=5000)
     ap.add_argument("--msir-chunk-concurrent", type=int, default=4)
     ap.add_argument("--msir-codec-concurrent", type=int, default=8)
     args = ap.parse_args()
 
-    msir.configure(chunk_concurrent_minimum=args.msir_chunk_concurrent,
-                   codec_concurrent_target=args.msir_codec_concurrent)
+    msir.configure(
+        chunk_concurrent_minimum=args.msir_chunk_concurrent, codec_concurrent_target=args.msir_codec_concurrent
+    )
 
     block = args.read_block_size
     bps = 4 * CROP * CROP * 4 + (0 if args.disable_mask else 1 * CROP * CROP)
 
-    discovered = discover_stores(args.store, args.label, CROP, args.disable_ivar,
-                                args.disable_mask, args.max_chunk_size)
+    discovered = discover_stores(
+        args.store, args.label, CROP, args.disable_ivar, args.disable_mask, args.max_chunk_size
+    )
     print(f"== zarr read benchmark (msir, read_block_size={block}, one metric: shuffled epoch) ==")
     print(f"  store={args.store}  -> {len(discovered)} store(s): {[d[1] for d in discovered]}")
-    print(f"  output_dir={args.output_dir}  crop={CROP}  ivar={'off' if args.disable_ivar else 'on'}  "
-          f"mask={'off' if args.disable_mask else 'on'}  "
-          f"epoch_samples={args.epoch_samples or 'all'}")
+    print(
+        f"  output_dir={args.output_dir}  crop={CROP}  ivar={'off' if args.disable_ivar else 'on'}  "
+        f"mask={'off' if args.disable_mask else 'on'}  "
+        f"epoch_samples={args.epoch_samples or 'all'}"
+    )
 
     rows = []
     for store, label, _lp in discovered:
         try:
-            r = bench_store(store, label, block, args.epoch_samples,
-                            disable_ivar=args.disable_ivar, disable_mask=args.disable_mask)
+            r = bench_store(
+                store, label, block, args.epoch_samples, disable_ivar=args.disable_ivar, disable_mask=args.disable_mask
+            )
         except Exception as e:
             print(f"\n--- {label}  store={store} ---", flush=True)
             print(f"  FAILED: {type(e).__name__}: {e}", file=sys.stderr)
@@ -437,53 +509,59 @@ def main() -> int:
             continue
         rows.append(r)
         print(f"\n--- {label}  store={store} ---", flush=True)
-        print(f"  n={r['n']}  epoch_samples={r['epoch_samples']}  "
-              f"epoch_s={r['epoch_s']}s  S_s={r['S_s']}  spatial={r['spatial']}  "
-              f"decomp/blk={_fmt(r['decomp_per_block'])}  disk={r['disk_gb']} GB", flush=True)
-        print(f"  {r['epoch_samples'] / r['epoch_s']:9.0f} samp/s  "
-              f"{mb_s(r['epoch_samples'], r['epoch_s'], bps):8.1f} MB/s", flush=True)
+        print(
+            f"  n={r['n']}  epoch_samples={r['epoch_samples']}  "
+            f"epoch_s={r['epoch_s']}s  S_s={r['S_s']}  spatial={r['spatial']}  "
+            f"decomp/blk={_fmt(r['decomp_per_block'])}  disk={r['disk_gb']} GB",
+            flush=True,
+        )
+        print(
+            f"  {r['epoch_samples'] / r['epoch_s']:9.0f} samp/s  "
+            f"{mb_s(r['epoch_samples'], r['epoch_s'], bps):8.1f} MB/s",
+            flush=True,
+        )
 
-    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     flat = []
     for r in rows:
         if "error" in r:
             flat.append({"label": r["label"], "error": r["error"], "samp_s": None})
             continue
         t = r["epoch_s"]
-        flat.append({"label": r["label"], "n": r["n"], "epoch_n": r["epoch_samples"],
-                     "med_s": t, "samp_s": (r["epoch_samples"] / t if t > 0 else float("inf")),
-                     "MB_s": mb_s(r["epoch_samples"], t, bps),
-                     "decomp": _fmt(r["decomp_per_block"]),
-                     "disk": _fmt(r["disk_gb"])})
+        flat.append({
+            "label": r["label"],
+            "n": r["n"],
+            "epoch_n": r["epoch_samples"],
+            "med_s": t,
+            "samp_s": (r["epoch_samples"] / t if t > 0 else float("inf")),
+            "MB_s": mb_s(r["epoch_samples"], t, bps),
+            "decomp": _fmt(r["decomp_per_block"]),
+            "disk": _fmt(r["disk_gb"]),
+        })
     flat.sort(key=lambda x: (x.get("samp_s") is None, -(x["samp_s"] if x.get("samp_s") else 0)))
-    print(f"\n\n===== RESULTS (msir, one metric: shuffled epoch, read_block_size={block}; "
-          f"sorted by samp/s desc) =====")
-    hdr = f"{'label':12s} {'n':>7s} {'epoch_n':>7s} {'epoch_s':>8s} {'samp/s':>9s} {'MB/s':>8s} {'decomp/blk':>10s} {'disk_GB':>8s}"
-    print(hdr); print("-" * len(hdr))
-    for fr in flat:
-        if "error" in fr:
-            print(f"{fr['label']:12s}  ERROR: {fr['error']}"); continue
-        print(f"{fr['label']:12s} {fr['n']:7d} {fr['epoch_n']:7d} {fr['med_s']:8.3f} "
-              f"{fr['samp_s']:9.0f} {fr['MB_s']:8.1f} {fr['decomp']:>10s} {fr['disk']:>8s}")
+    print(f"\n\n===== RESULTS (msir, one metric: shuffled epoch, read_block_size={block}; sorted by samp/s desc) =====")
+    print(tabulate([_table_row(fr) for fr in flat], headers=HEADERS, tablefmt="grid", colalign=COLALIGN))
 
     jpath = out_dir / f"{args.run_name}.json"
     mpath = out_dir / f"{args.run_name}.md"
-    payload = dict(backend=f"msir {getattr(msir, '__version__', '?')}", read_block_size=block,
-                   crop=CROP, epoch_samples=args.epoch_samples,
-                   bytes_per_sample=bps, stores=rows)
+    payload = dict(
+        backend=f"msir {getattr(msir, '__version__', '?')}",
+        read_block_size=block,
+        crop=CROP,
+        epoch_samples=args.epoch_samples,
+        bytes_per_sample=bps,
+        stores=rows,
+    )
     jpath.write_text(json.dumps(payload, indent=2))
-    lines = [f"# zarr read benchmark (msir, one metric: shuffled epoch, read_block_size={block})\n",
-             f"crop={CROP} epoch_samples={args.epoch_samples or 'all'}. "
-             f"One shuffled epoch per store: every sample read exactly once in random order "
-             f"(DataLoader pattern); dataset large enough for cache effects to be negligible. "
-             f"Sorted by samp/s desc.\n",
-             "| label | n | epoch_n | epoch_s | samp/s | MB/s | decomp/blk | disk_GB |",
-             "|---|---|---|---|---|---|---|---|"]
-    for fr in flat:
-        if "error" in fr:
-            lines.append(f"| {fr['label']} | | | ERROR | | | | | {fr['error']} |"); continue
-        lines.append(f"| {fr['label']} | {fr['n']} | {fr['epoch_n']} | {fr['med_s']:.3f} | "
-                     f"{fr['samp_s']:.0f} | {fr['MB_s']:.1f} | {fr['decomp']} | {fr['disk']} |")
+    lines = [
+        f"# zarr read benchmark (msir, one metric: shuffled epoch, read_block_size={block})\n",
+        f"crop={CROP} epoch_samples={args.epoch_samples or 'all'}. "
+        f"One shuffled epoch per store: every sample read exactly once in random order "
+        f"(DataLoader pattern); dataset large enough for cache effects to be negligible. "
+        f"Sorted by samp/s desc.\n",
+        tabulate([_table_row(fr) for fr in flat], headers=HEADERS, tablefmt="github", colalign=COLALIGN),
+    ]
     mpath.write_text("\n".join(lines) + "\n")
     print(f"\nWrote {jpath} and {mpath}")
     return 0

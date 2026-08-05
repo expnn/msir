@@ -16,6 +16,7 @@ dynamic = ["version"]
 dev = [
     "numpy>=1.24.4",
     "s3fs>=2024.10.0",
+    "tabulate>=0.9.0",
     "tqdm>=4.70.0",
     "zarr>=2.16.1",
 ]
@@ -55,17 +56,17 @@ extend-select = [
 ]
 
 extend-ignore = [
-    "INP001",  # 允许隐式的 package. 避免创建很多空的 __init__.py 文件. 目前我没有发现不使用 __init__.py 文件有什么问题
-    "RUF001",
-    "RUF002",
-    "RET505",  # 允许多余的 else. 个人觉得 if-else 匹配，代码层级更清楚，更容易判断程序的逻辑完备性.
-    "ERA001",  # 允许注释掉的代码
-    "S101",  # 允许使用 assert
-    "RUF013", # 允许隐式的可选值.
-    "T201", # 允许 print 函数. 这个对于实验性代码非常有用.
-    "T203", # 允许 pprint 函数. 这个对于实验性代码非常有用.
-    "RUF003", # 注释里允许中文逗号.
-    "E501", # Line too long, 按理不应该忽略该规则, 但是貌似它对中文的长度检测不正确, 会导致大量误报. 因此手工依赖 IDE 而非 该规则.
+    "implicit-namespace-package",  # 允许隐式的 package. 避免创建很多空的 __init__.py 文件. 目前我没有发现不使用 __init__.py 文件有什么问题
+    "ambiguous-unicode-character-string",
+    "ambiguous-unicode-character-docstring",
+    "superfluous-else-return",  # 允许多余的 else. 个人觉得 if-else 匹配，代码层级更清楚，更容易判断程序的逻辑完备性.
+    "commented-out-code",  # 允许注释掉的代码
+    "assert",  # 允许使用 assert
+    "implicit-optional", # 允许隐式的可选值.
+    "print", # 允许 print 函数. 这个对于实验性代码非常有用.
+    "p-print", # 允许 pprint 函数. 这个对于实验性代码非常有用.
+    "ambiguous-unicode-character-comment", # 注释里允许中文逗号.
+    "line-too-long", # Line too long, 按理不应该忽略该规则, 但是貌似它对中文的长度检测不正确, 会导致大量误报. 因此手工依赖 IDE 而非 该规则.
 ]
 
 [tool.ruff.format]
