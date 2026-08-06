@@ -91,7 +91,9 @@ class AstroImageReader:
         批量读取样本
 
         当 `read_block_size > 1` 时，indices 中每个值代表一个 block 的起始全局索引，
-        实际输出的 batch_size = indices.len() * read_block_size。
+        通常输出 batch_size = indices.len() * read_block_size。
+        若某个 block 越过数组末尾，则按实际存在的行数截断（与 Python 后备实现一致），
+        因此该 block 的贡献可能小于 read_block_size。
         当 `read_block_size == 1` 时，行为与传统逐样本读取等价。
 
         Args:

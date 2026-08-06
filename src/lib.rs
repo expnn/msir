@@ -659,7 +659,9 @@ impl AstroImageReader {
     /// 批量读取样本
     ///
     /// 当 `read_block_size > 1` 时，indices 中每个值代表一个 block 的起始全局索引，
-    /// 实际输出的 batch_size = indices.len() * read_block_size。
+    /// 通常输出 batch_size = indices.len() * read_block_size。
+    /// 若某个 block 越过数组末尾，则按实际存在的行数截断（与 Python 后备实现一致），
+    /// 因此该 block 的贡献可能小于 read_block_size。
     /// 当 `read_block_size == 1` 时，行为与传统逐样本读取等价。
     ///
     /// Args:
@@ -1173,8 +1175,12 @@ impl AstroImageReader {
     ///
     /// 与 `read_single_example` 的关键区别:
     /// - `ArraySubset` 的 N 维范围为 `[start..start+block_size]`
-    /// - 返回 4D 数组 (block_size, C, H, W)
+    /// - 返回 4D 数组 (N, C, H, W)，N 为实际可读行数
     /// - 单次 `retrieve_array_subset` 调用覆盖整个 block
+    ///
+    /// 末尾不足一个块时截断到数组实际行数，与 Python 后备实现
+    /// `AstroImageReader.read_block` 的切片行为一致，不使用 Zarr 的
+    /// `fill_value` 填充越界行。
     fn read_block_examples(&self, subset_path: &str, start_local_idx: usize) -> BlockResult {
         let store = &self.store;
         let block_size = self.read_block_size;
@@ -1202,9 +1208,17 @@ impl AstroImageReader {
         let start_y = (height - self.crop_size) / 2;
         let start_x = (width - self.crop_size) / 2;
 
-        // 读取 flux: (block_size, C, H, W)
+        let total_rows = shape[0] as usize;
+        if start_local_idx >= total_rows {
+            return Err(MsirError::IndexOutOfBounds(start_local_idx).into());
+        }
+        // 与 Python 后备实现一致：尾部不完整块只返回实际存在的行，
+        // 避免把 Zarr 对越界行返回的 fill_value 当作真实样本。
+        let num_rows = block_size.min(total_rows - start_local_idx);
+
+        // 读取 flux: (num_rows, C, H, W)
         let flux_subset = ArraySubset::new_with_ranges(&[
-            start_local_idx as u64..(start_local_idx + block_size) as u64,
+            start_local_idx as u64..(start_local_idx + num_rows) as u64,
             0..shape[1],
             start_y as u64..(start_y + self.crop_size) as u64,
             start_x as u64..(start_x + self.crop_size) as u64,
@@ -1216,7 +1230,7 @@ impl AstroImageReader {
 
         let flux_4d = flux_data
             .into_shape_with_order(ndarray::IxDyn(&[
-                block_size,
+                num_rows,
                 self.num_channels,
                 self.crop_size,
                 self.crop_size,
@@ -1235,7 +1249,7 @@ impl AstroImageReader {
             let (mask_subset, num_mask_channels) = if mask_shape.len() == 4 {
                 (
                     ArraySubset::new_with_ranges(&[
-                        start_local_idx as u64..(start_local_idx + block_size) as u64,
+                        start_local_idx as u64..(start_local_idx + num_rows) as u64,
                         0..mask_shape[1],
                         start_y as u64..(start_y + self.crop_size) as u64,
                         start_x as u64..(start_x + self.crop_size) as u64,
@@ -1245,7 +1259,7 @@ impl AstroImageReader {
             } else {
                 (
                     ArraySubset::new_with_ranges(&[
-                        start_local_idx as u64..(start_local_idx + block_size) as u64,
+                        start_local_idx as u64..(start_local_idx + num_rows) as u64,
                         start_y as u64..(start_y + self.crop_size) as u64,
                         start_x as u64..(start_x + self.crop_size) as u64,
                     ]),
@@ -1259,7 +1273,7 @@ impl AstroImageReader {
 
             let mask_4d = mask_data
                 .into_shape_with_order(ndarray::IxDyn(&[
-                    block_size,
+                    num_rows,
                     num_mask_channels,
                     self.crop_size,
                     self.crop_size,
@@ -1280,7 +1294,7 @@ impl AstroImageReader {
                 .map_err(|e| PyValueError::new_err(format!("Failed to open ivar: {}", e)))?;
 
             let ivar_subset = ArraySubset::new_with_ranges(&[
-                start_local_idx as u64..(start_local_idx + block_size) as u64,
+                start_local_idx as u64..(start_local_idx + num_rows) as u64,
                 0..shape[1],
                 start_y as u64..(start_y + self.crop_size) as u64,
                 start_x as u64..(start_x + self.crop_size) as u64,
@@ -1292,7 +1306,7 @@ impl AstroImageReader {
 
             let ivar_4d = ivar_data
                 .into_shape_with_order(ndarray::IxDyn(&[
-                    block_size,
+                    num_rows,
                     self.num_channels,
                     self.crop_size,
                     self.crop_size,
