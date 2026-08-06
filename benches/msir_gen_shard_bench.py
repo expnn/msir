@@ -88,17 +88,17 @@ def open_source(src: str):
 
 def load_source(src: str, n: int):
     g = open_source(src)
-    flux = np.asarray(g["flux"][0:n])
-    ivar = np.asarray(g["ivar"][0:n]) if "ivar" in g else None
-    mask = np.asarray(g["mask"][0:n]) if "mask" in g else None
+    flux = np.asarray(g["flux"][0:n])  # type: ignore[reportArgumentType,reportCallIssue,reportIndexIssue]
+    ivar = np.asarray(g["ivar"][0:n]) if "ivar" in g else None  # type: ignore[reportArgumentType,reportCallIssue,reportIndexIssue]
+    mask = np.asarray(g["mask"][0:n]) if "mask" in g else None  # type: ignore[reportArgumentType,reportCallIssue,reportIndexIssue]
     return flux, ivar, mask
 
 
 def write_variant(
     out_dir: Path,
     name: str,
-    M: int,
-    X: int,
+    m: int,
+    x: int,
     config: str,
     shard_samples: int,
     shard_sp: int,
@@ -106,12 +106,12 @@ def write_variant(
     ivar_all,
     mask_all,
 ) -> None:
-    """Write one variant. Shard spatial = shard_sp = max(32, X)."""
+    """Write one variant. Shard spatial = shard_sp = max(32, x)."""
     vdir = out_dir / name
     if vdir.exists():
         shutil.rmtree(vdir)
     vdir.mkdir(parents=True, exist_ok=True)
-    n, bands, H, W = flux_all.shape
+    n, bands, h, w = flux_all.shape
     cke = DefaultChunkKeyEncoding(separator=".")
     compressors = NOCOMP if config == "nocomp" else ZSTD
     sharded = config != "noshard"
@@ -119,32 +119,34 @@ def write_variant(
     flux_shards = (shard_samples, bands, shard_sp, shard_sp) if sharded else None
     store = zarr.storage.LocalStore(vdir, read_only=False)
     g = zarr.open_group(store=store, mode="a").require_group("00")
-    g.create_array(
+    zf = g.create_array(
         "flux",
-        shape=(0, bands, H, W),
-        chunks=(M, bands, X, X),
+        shape=(0, bands, h, w),
+        chunks=(m, bands, x, x),
         shards=flux_shards,
         dtype="float32",
         chunk_key_encoding=cke,
         compressors=compressors,
     )
     if ivar_all is not None:
-        g.create_array(
+        zi = g.create_array(
             "ivar",
-            shape=(0, bands, H, W),
-            chunks=(M, bands, X, X),
+            shape=(0, bands, h, w),
+            chunks=(m, bands, x, x),
             shards=flux_shards,
             dtype="float32",
             chunk_key_encoding=cke,
             compressors=compressors,
         )
+    else:
+        zi = None
     if mask_all is not None:
         if mask_all.ndim == 3:  # (n, H, W)
-            mchunks = (M, X, X)
+            mchunks = (m, x, x)
             mshards = (shard_samples, shard_sp, shard_sp) if sharded else None
-            g.create_array(
+            zm = g.create_array(
                 "mask",
-                shape=(0, H, W),
+                shape=(0, h, w),
                 chunks=mchunks,
                 shards=mshards,
                 dtype="bool",
@@ -153,32 +155,31 @@ def write_variant(
                 compressors=compressors,
             )
         else:  # (n, bands, H, W)
-            g.create_array(
+            zm = g.create_array(
                 "mask",
-                shape=(0, bands, H, W),
-                chunks=(M, bands, X, X),
+                shape=(0, bands, h, w),
+                chunks=(m, bands, x, x),
                 shards=flux_shards,
                 dtype="bool",
                 fill_value=True,
                 chunk_key_encoding=cke,
                 compressors=compressors,
             )
-    zf = g["flux"]
-    zi = g["ivar"] if ivar_all is not None else None
-    zm = g["mask"] if mask_all is not None else None
-    zf.resize((n, bands, H, W))
+    else:
+        zm = None
+    zf.resize((n, bands, h, w))
     if zi is not None:
-        zi.resize((n, bands, H, W))
+        zi.resize((n, bands, h, w))
     if zm is not None:
-        zm.resize(mask_all.shape)
+        zm.resize(mask_all.shape)  # type: ignore[reportOptionalMemberAccess]
     step = max(1, shard_samples)
     for s in tqdm(range((n + step - 1) // step), desc=f"write {name}", unit="shard"):
         i, j = s * step, min((s + 1) * step, n)
         zf[i:j] = flux_all[i:j]
         if zi is not None:
-            zi[i:j] = ivar_all[i:j]
+            zi[i:j] = ivar_all[i:j]  # type: ignore[reportOptionalSubscript]
         if zm is not None:
-            zm[i:j] = mask_all[i:j]
+            zm[i:j] = mask_all[i:j]  # type: ignore[reportOptionalSubscript]
 
 
 def directory_size(p) -> int:
@@ -228,29 +229,29 @@ def main() -> int:
     print(f"== gen variants: M={args.chunk_samples} X={args.spatial} configs={args.configs} N={args.shard_samples} ==")
     t0 = time.perf_counter()
     flux, ivar, mask = load_source(args.src, args.n_samples)
-    n, bands, H, W = flux.shape
+    n, bands, h, w = flux.shape
     print(
         f"  loaded {n} samples in {time.perf_counter() - t0:.1f}s "
-        f"(flux {flux.nbytes / 1e9:.2f} GB; bands={bands} HxW={H}x{W})"
+        f"(flux {flux.nbytes / 1e9:.2f} GB; bands={bands} HxW={h}x{w})"
     )
 
     # Validate spatial: X must divide H, W; shard_sp=max(32,X) must divide H, W
     # and be a multiple of X (shard must contain whole chunks).
-    for X in args.spatial:
-        shard_sp = max(32, X)
-        if H % X != 0 or W % X != 0:
-            print(f"ERROR: chunk spatial X={X} must divide image HxW={H}x{W}", file=sys.stderr)
+    for x in args.spatial:
+        shard_sp = max(32, x)
+        if h % x != 0 or w % x != 0:
+            print(f"ERROR: chunk spatial X={x} must divide image HxW={h}x{w}", file=sys.stderr)
             return 2
-        if H % shard_sp != 0 or W % shard_sp != 0:
-            print(f"ERROR: shard spatial max(32,{X})={shard_sp} must divide image HxW={H}x{W}", file=sys.stderr)
+        if h % shard_sp != 0 or w % shard_sp != 0:
+            print(f"ERROR: shard spatial max(32,{x})={shard_sp} must divide image HxW={h}x{w}", file=sys.stderr)
             return 2
-        if shard_sp % X != 0:
-            print(f"ERROR: shard spatial {shard_sp} must be a multiple of chunk spatial {X}", file=sys.stderr)
+        if shard_sp % x != 0:
+            print(f"ERROR: shard spatial {shard_sp} must be a multiple of chunk spatial {x}", file=sys.stderr)
             return 2
 
     # Validate sample: N must be divisible by M (for sharded configs)
     if any(c != "noshard" for c in args.configs):
-        bad = [M for M in args.chunk_samples if args.shard_samples % M != 0]
+        bad = [m for m in args.chunk_samples if args.shard_samples % m != 0]
         if bad:
             print(
                 f"ERROR: M {bad} must divide --shard-samples {args.shard_samples} (for sharded configs)",
@@ -259,13 +260,13 @@ def main() -> int:
             return 2
 
     sizes = {}
-    for M in args.chunk_samples:
-        for X in args.spatial:
-            shard_sp = max(32, X)
+    for m in args.chunk_samples:
+        for x in args.spatial:
+            shard_sp = max(32, x)
             for cfg in args.configs:
-                name = f"s{M}_sp{X}_s{shard_sp}_{cfg}"
+                name = f"s{m}_sp{x}_s{shard_sp}_{cfg}"
                 t0 = time.perf_counter()
-                write_variant(out_dir, name, M, X, cfg, args.shard_samples, shard_sp, flux, ivar, mask)
+                write_variant(out_dir, name, m, x, cfg, args.shard_samples, shard_sp, flux, ivar, mask)
                 sizes[name] = directory_size(out_dir / name)
                 print(
                     f"  wrote {name}: {time.perf_counter() - t0:.1f}s  {sizes[name] / 1e9:.3f} GB (shard_sp={shard_sp})"

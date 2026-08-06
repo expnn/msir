@@ -56,7 +56,6 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import msir
 import numpy as np
@@ -81,7 +80,7 @@ def resolve_zarr_url(p: str) -> str:
     return "file://" + str(Path(p).resolve())
 
 
-def local_path_of(store: str) -> Optional[Path]:
+def local_path_of(store: str) -> Path | None:
     if SCHEME_RE.match(store):
         if store.lower().startswith("file://"):
             return Path(store[len("file://") :])
@@ -131,7 +130,7 @@ def detect_chunk_shape(root: Path):
             cs = _inner_chunk_shape(f)
             if cs and len(cs) >= 4:
                 return int(cs[0]), int(cs[-1])
-        except Exception:
+        except Exception:  # ruff: ignore[blind-except, try-except-continue]
             continue
     return None
 
@@ -150,15 +149,15 @@ def detect_chunk_shape_remote(store: str):
             name = e.rsplit("/", 1)[-1]
             if name and fs.isdir(e):
                 candidates.append(f"{base}/{name}/flux/zarr.json")
-    except Exception:
+    except Exception:  # ruff: ignore[blind-except, try-except-pass]
         pass
     for c in candidates:
         try:
-            md = json.loads(fs.cat(c))
+            md = json.loads(fs.cat(c))  # type: ignore[arg-type]
             cs = _chunk_shape_from_dict(md)
             if cs and len(cs) >= 4:
                 return int(cs[0]), int(cs[-1])
-        except Exception:
+        except Exception:  # ruff: ignore[blind-except, try-except-continue]
             continue
     return None
 
@@ -209,7 +208,7 @@ def mb_s(samples, seconds, bps=BYTES_PER_SAMPLE):
     return samples * bps / seconds / 1e6 if seconds > 0 else float("inf")
 
 
-def directory_size(p: Optional[Path]) -> int:
+def directory_size(p: Path | None) -> int:
     if not p or not p.is_dir():
         return 0
     return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
@@ -221,6 +220,7 @@ def bench_store(store: str, label: str, block, epoch_samples, seed=7331, disable
     r = make_reader(store_url, block, disable_ivar=disable_ivar, disable_mask=disable_mask)
     n = r.total_samples
     out = r.read_batch(np.array([0], dtype=np.uintp))
+    assert out is not None
     assert out[0].shape == (block, 4, CROP, CROP), out[0].shape
     epoch_n = min(epoch_samples, n) if epoch_samples else n
     # 单次 shuffled epoch：每样本恰好读一次（DataLoader 模式）。
@@ -236,22 +236,22 @@ def bench_store(store: str, label: str, block, epoch_samples, seed=7331, disable
             detect_chunk_shape_remote(store) if store.startswith(("oss://", "s3://", "http://", "https://")) else None
         )
     )
-    S_s = int(det[0]) if det else None
+    s_s = int(det[0]) if det else None
     spatial = int(det[1]) if det else None
     tiles = spatial_tiles(spatial) if spatial else None
-    decomp_per_block = ((block // S_s) * tiles) if (S_s and tiles) else None
-    return dict(
-        store=store,
-        label=label,
-        n=n,
-        epoch_samples=epoch_n_read,
-        read_block_size=block,
-        epoch_s=round(t, 4),
-        S_s=S_s,
-        spatial=spatial,
-        decomp_per_block=decomp_per_block,
-        disk_gb=round(directory_size(lp) / 1e9, 3) if lp else None,
-    )
+    decomp_per_block = ((block // s_s) * tiles) if (s_s and tiles) else None
+    return {
+        "store": store,
+        "label": label,
+        "n": n,
+        "epoch_samples": epoch_n_read,
+        "read_block_size": block,
+        "epoch_s": round(t, 4),
+        "S_s": s_s,
+        "spatial": spatial,
+        "decomp_per_block": decomp_per_block,
+        "disk_gb": round(directory_size(lp) / 1e9, 3) if lp else None,
+    }
 
 
 def _fmt(v):
@@ -371,7 +371,7 @@ def discover_stores(store, label, crop, disable_ivar, disable_mask, max_chunk):
             )
             _ = r.total_samples  # forces group open + make_index
             return [(store, label or _derive_label(store), None)]
-        except Exception:
+        except Exception:  # ruff: ignore[blind-except, try-except-pass]
             pass
         bucket, rest = _remote_parts(store)
         try:
@@ -405,7 +405,7 @@ def discover_stores(store, label, crop, disable_ivar, disable_mask, max_chunk):
         )
         _ = r.total_samples
         return [(url, label or _derive_label(store), local_path_of(store))]
-    except Exception:
+    except Exception:  # ruff: ignore[blind-except, try-except-pass]
         pass
     kids = []
     lp = local_path_of(store)
@@ -416,7 +416,7 @@ def discover_stores(store, label, crop, disable_ivar, disable_mask, max_chunk):
                 ch = lp / k
                 if ch.is_dir():
                     kids.append(("file://" + str(ch.resolve()), k, ch))
-        except Exception:
+        except Exception:  # ruff: ignore[blind-except, try-except-pass]
             pass
         if not kids:  # fallback: filesystem iterdir (no container zarr.json)
             for ch in sorted(lp.iterdir()):
@@ -502,10 +502,10 @@ def main() -> int:
             r = bench_store(
                 store, label, block, args.epoch_samples, disable_ivar=args.disable_ivar, disable_mask=args.disable_mask
             )
-        except Exception as e:
+        except Exception as e:  # ruff: ignore[blind-except]
             print(f"\n--- {label}  store={store} ---", flush=True)
             print(f"  FAILED: {type(e).__name__}: {e}", file=sys.stderr)
-            rows.append(dict(store=store, label=label, error=f"{type(e).__name__}: {e}"))
+            rows.append({"store": store, "label": label, "error": f"{type(e).__name__}: {e}"})
             continue
         rows.append(r)
         print(f"\n--- {label}  store={store} ---", flush=True)
@@ -516,7 +516,7 @@ def main() -> int:
             flush=True,
         )
         print(
-            f"  {r['epoch_samples'] / r['epoch_s']:9.0f} samp/s  "
+            f"  {r['epoch_samples'] / r['epoch_s']:9.0f} samp/s  "  # type: ignore[operator]
             f"{mb_s(r['epoch_samples'], r['epoch_s'], bps):8.1f} MB/s",
             flush=True,
         )
@@ -545,21 +545,23 @@ def main() -> int:
 
     jpath = out_dir / f"{args.run_name}.json"
     mpath = out_dir / f"{args.run_name}.md"
-    payload = dict(
-        backend=f"msir {getattr(msir, '__version__', '?')}",
-        read_block_size=block,
-        crop=CROP,
-        epoch_samples=args.epoch_samples,
-        bytes_per_sample=bps,
-        stores=rows,
-    )
+    payload = {
+        "backend": f"msir {getattr(msir, '__version__', '?')}",
+        "read_block_size": block,
+        "crop": CROP,
+        "epoch_samples": args.epoch_samples,
+        "bytes_per_sample": bps,
+        "stores": rows,
+    }
     jpath.write_text(json.dumps(payload, indent=2))
     lines = [
         f"# zarr read benchmark (msir, one metric: shuffled epoch, read_block_size={block})\n",
-        f"crop={CROP} epoch_samples={args.epoch_samples or 'all'}. "
-        f"One shuffled epoch per store: every sample read exactly once in random order "
-        f"(DataLoader pattern); dataset large enough for cache effects to be negligible. "
-        f"Sorted by samp/s desc.\n",
+        (
+            f"crop={CROP} epoch_samples={args.epoch_samples or 'all'}. "
+            f"One shuffled epoch per store: every sample read exactly once in random order "
+            f"(DataLoader pattern); dataset large enough for cache effects to be negligible. "
+            f"Sorted by samp/s desc.\n"
+        ),
         tabulate([_table_row(fr) for fr in flat], headers=HEADERS, tablefmt="github", colalign=COLALIGN),
     ]
     mpath.write_text("\n".join(lines) + "\n")
